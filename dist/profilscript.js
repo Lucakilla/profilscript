@@ -1,4 +1,4 @@
-<script>
+
 (async function(){ try{
   // ===== helpers, die dein Code unten erwartet =====
 const APP_HOME = '/rezepte';
@@ -379,8 +379,7 @@ $('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click());
       editBtn.onclick = () => { /* TODO: Caption editieren */ };
       const delBtn = document.createElement('button');
       delBtn.textContent = 'Beitrag löschen';
-      delBtn.onclick = async () => { if (!confirm('Beitrag wirklich löschen?')) return; const sb = await getSB(); const { error } = await sb.rpc('delete_hund_des_monats', { p_bild_id: pic.id, p_memberstack_id: my
-        Id }); if (error) { alert('Löschen fehlgeschlagen'); return; } menuList.style.display = 'none'; closeHdmDetailInProfile(); clearCachedPosts?.(uid); await loadPostsFor(uid); showDoggoSnackbar?.('Beitrag gelöscht ✅'); };
+      delBtn.onclick = async () => { if (!confirm('Beitrag wirklich löschen?')) return; const sb = await getSB(); const { error } = await sb.rpc('delete_hund_des_monats', { p_bild_id: pic.id, p_memberstack_id: myId }); if (error) { alert('Löschen fehlgeschlagen'); return; } menuList.style.display = 'none'; closeHdmDetailInProfile(); clearCachedPosts?.(uid); await loadPostsFor(uid); showDoggoSnackbar?.('Beitrag gelöscht ✅'); };
       menuList.append(editBtn, delBtn);
     } else {
       const reportBtn = document.createElement('button');
@@ -590,4 +589,3 @@ $('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click());
   console.error('[DM FATAL]', e);
 }
 })();
-</script>
