@@ -497,7 +497,15 @@ $('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click());
     const profileUid = myId;
     hydrate(myCF, true);
     await loadPostsFor(profileUid);
-
+    
+// DGMlikes Modul initialisieren (falls vorhanden)
+    if (window.DGMlikes && typeof window.DGMlikes.init === 'function') {
+      try {
+        await window.DGMlikes.init();
+      } catch(e) {
+        console.warn('[DGMlikes init]', e);
+      }
+    }
     function extFromType(blob){ return blob?.type === 'image/webp' ? '.webp' : (blob?.type === 'image/png' ? '.png' : '.jpg'); }
     $('#dm2FabAdd')?.addEventListener('click', ()=> ui.galleryFile?.click());
     ui.galleryFile?.addEventListener('change', async (e)=>{ const f = e.target.files?.[0]; if(!f) return; const me = await getMemberNormalized(ms); const myId = me.id; if(!myId){ alert('Bitte einloggen.'); return; } const compressed = await window.compressImage(f, { maxW:1600, maxH:1600, targetBytes:600*1024, mimePreferred:'image/webp' }); const uploadFile = compressed || f; const safe = s=>s.replace(/[^a-zA-Z0-9._-]/g,'_'); const base = `g_${Date.now()}_${safe(f.name)}`.replace(/\.(heic|heif|png|jpe?g|webp|avif)$/i,''); const path = `${myId}/${base}${extFromType(uploadFile)}`; const up = await sb.storage.from('profile-gallery').upload(path, uploadFile, { upsert:true, cacheControl:'3600' }); if(up?.error){ alert('Upload fehlgeschlagen: '+up.error.message); return; } const pub = sb.storage.from('profile-gallery').getPublicUrl(path); const newUrl = pub?.data?.publicUrl || ''; clearCachedGallery(myId); await loadGalleryFor(myId); e.target.value=''; if(newUrl){ openProfilePhotoDetail({ uid: String(myId), name: path.split('/').pop(), url: newUrl }); } });
