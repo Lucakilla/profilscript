@@ -341,13 +341,63 @@ $('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click());
     const cached = getCachedPosts(profileUid);
     if (cached && cached.length) renderHdmGrid(cached);
     if (!sb || !profileUid){ if (!cached?.length){ hdmSection.style.display = 'none'; } await loadGalleryFor(profileUid); return; }
-    let pics = [];
-    try{
-      const r1 = await sb.from('hund_des_monats').select('id,bild_url,hundename,memberstack_id,member_id,owner_id,uid,created_at,caption').or(`memberstack_id.eq.${profileUid},member_id.eq.${profileUid},owner_id.eq.${profileUid},uid.eq.${profileUid}`).order('created_at',{ascending:false});
-      pics = r1.data || [];
-      try{ const ms = await getMS(); const me = ms ? await getMemberNormalized(ms) : { id:null }; const viewerId = me?.id || null; pics = await enrichLikesWithoutRpc(sb, pics, viewerId); }catch(_){}
-      if(!pics.length){ const likePattern = `%${profileUid}_%`; const r2 = await sb.from('hund_des_monats').select('id,bild_url,hundename,created_at,caption').like('bild_url', likePattern).order('created_at',{ascending:false}); pics = r2.data || []; }
-    }catch(e){ console.warn('[HDM posts ERROR]', e); }
+let pics = [];
+try {
+  // 1) Direkte Zuordnung über memberstack_id / member_id / owner_id / uid
+  const r1 = await sb
+    .from('hund_des_monats')
+    .select('id,bild_url,hundename,memberstack_id,member_id,owner_id,uid,created_at,caption')
+    .or(`memberstack_id.eq.${profileUid},member_id.eq.${profileUid},owner_id.eq.${profileUid},uid.eq.${profileUid}`)
+    .order('created_at', { ascending: false });
+
+  pics = r1.data || [];
+
+  // 2) Falls leer: Fallback über Dateinamen-Muster
+  if (!pics.length) {
+    const likePattern = `%${profileUid}_%`;
+    const r2 = await sb
+      .from('hund_des_monats')
+      .select('id,bild_url,hundename,created_at,caption')
+      .like('bild_url', likePattern)
+      .order('created_at', { ascending: false });
+    pics = r2.data || [];
+  }
+
+  // 3) Falls immer noch leer: RPC-Fallback (lief früher bei dir)
+  if (!pics.length && sb.rpc) {
+    try {
+      const r3 = await sb.rpc('get_hund_des_monats_with_likes', { p_memberstack_id: profileUid });
+      const all = r3?.data || [];
+      pics = all
+        .filter(p => [p.memberstack_id, p.member_id, p.owner_id, p.uid].filter(Boolean).map(String)
+          .includes(String(profileUid)))
+        .map(p => ({
+          id: p.id,
+          bild_url: p.bild_url,
+          hundename: p.hundename,
+          memberstack_id: p.memberstack_id || p.member_id || p.owner_id || p.uid,
+          created_at: p.created_at,
+          caption: p.caption || '',
+          likes: Number(p.likes || 0),
+          liked: !!p.liked
+        }));
+    } catch (e) {
+      console.warn('[HDM RPC fallback failed]', e);
+    }
+  }
+
+  // Likes anreichern, wenn aus 1) / 2) noch keine likes/liked drin sind
+  try {
+    const ms = await getMS();
+    const me = ms ? await getMemberNormalized(ms) : { id: null };
+    const viewerId = me?.id || null;
+    const missing = !(pics || []).some(p => ('likes' in p) || ('liked' in p));
+    if (missing) pics = await enrichLikesWithoutRpc(sb, pics, viewerId);
+  } catch (_) {}
+} catch (e) {
+  console.warn('[HDM posts ERROR]', e);
+}
+
     setCachedPosts(profileUid, pics);
     renderHdmGrid(pics);
     const galleryCount = await loadGalleryFor(profileUid);
@@ -661,8 +711,8 @@ if (window.DGMlikes && typeof window.DGMlikes.init === 'function') {
 
     async function pg_loadCaption(item){ try{ const sb = await getSB(); const { data } = await sb.from('profile_gallery_meta').select('caption').eq('memberstack_id', item.uid).eq('file_name', item.name).maybeSingle(); return data?.caption || ''; }catch{ return ''; } }
     async function pg_saveCaption(item, text){ try{ const sb = await getSB(); await sb.from('profile_gallery_meta').upsert({ memberstack_id:item.uid, file_name:item.name, caption:text }, { onConflict:'memberstack_id,file_name' }); }catch(_){} }
-    async function pg_renderCaption(item){ const row = document.getElementById('pg-detail-caption-row'); row.innerHTML=''; const hundename = document.getElementById('pg-profile-username')?.textContent || 'Doggo'; const wrap = document.createElement('span'); wrap.className='hdm-caption-wrap'; const text = document.createElement('span'); text.className='hdm-caption-text'; text.textContent = await pg_loadCaption(item); const 
-      username = document.createElement('span'); username.className='hdm-caption-username'; username.textContent = hundename; row.append(username, wrap); wrap.appendChild(text); if(text.textContent.trim()){ text.classList.add('caption-truncate'); requestAnimationFrame(()=>{ const clamped = text.scrollHeight > text.clientHeight + 1; if(!clamped) text.classList.remove('caption-truncate'); else{ const t=document.createElement('button'); t.className='caption-more-btn'; t.textContent='mehr'; let expanded=false; t.onclick=()=>{ expanded=!expanded; text.classList.toggle('caption-truncate', !expanded); t.textContent=expanded?'weniger':'mehr'; }; wrap.appendChild(t); } }); } }
+    async function pg_renderCaption(item){ const row = document.getElementById('pg-detail-caption-row'); row.innerHTML=''; const hundename = document.getElementById('pg-profile-username')?.textContent || 'Doggo'; const wrap = document.createElement('span'); wrap.className='hdm-caption-wrap'; const text = document.createElement('span'); text.className='hdm-caption-text'; text.textContent = await pg_loadCaption(item);
+const username = document.createElement('span'); username.className='hdm-caption-username'; username.textContent = hundename; row.append(username, wrap); wrap.appendChild(text); if(text.textContent.trim()){ text.classList.add('caption-truncate'); requestAnimationFrame(()=>{ const clamped = text.scrollHeight > text.clientHeight + 1; if(!clamped) text.classList.remove('caption-truncate'); else{ const t=document.createElement('button'); t.className='caption-more-btn'; t.textContent='mehr'; let expanded=false; t.onclick=()=>{ expanded=!expanded; text.classList.toggle('caption-truncate', !expanded); t.textContent=expanded?'weniger':'mehr'; }; wrap.appendChild(t); } }); } }
     function pg_editCaption(item){ const row = document.getElementById('pg-detail-caption-row'); const old = row.textContent?.trim() ? row.querySelector('.hdm-caption-text')?.textContent || '' : ''; row.innerHTML = `<textarea id="pg-caption-input" rows="2" placeholder="Beschreibe das Bild...">${old||''}</textarea><button class="caption-save-btn" id="pg-caption-save">Speichern</button>`; document.getElementById('pg-caption-save').onclick = async ()=>{ const val = (document.getElementById('pg-caption-input').value||'').trim(); await pg_saveCaption(item, val); await pg_renderCaption(item); }; }
 
 function attachEdgeSwipePG(overlayEl, onDismiss, scrollSelector){
