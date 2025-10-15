@@ -1,3 +1,49 @@
+// ---- DGMlikes Fallback (GANZ OBEN in dieselbe JS-Datei setzen) ----
+(function () {
+  if (window.DGMlikes) return;
+
+  const CSS = `
+    .hdm-like-btn{display:inline-flex;align-items:center;gap:.4rem;border:0;background:transparent;
+      font:inherit;cursor:pointer;padding:.25rem .4rem;border-radius:12px;user-select:none}
+    .hdm-like-btn .hdm-heart{display:inline-block;transform:translateY(1px)}
+    .hdm-like-btn.liked .hdm-heart{filter: drop-shadow(0 0 0 rgba(0,0,0,.1))}
+    .hdm-like-num{min-width:1.2em;text-align:right}
+  `;
+  function injectCss(){
+    if (document.getElementById('dgm-likes-css')) return;
+    const s=document.createElement('style'); s.id='dgm-likes-css'; s.textContent=CSS;
+    document.head.appendChild(s);
+  }
+
+  function renderButton(mount, opts){
+    injectCss();
+    if (!mount) return null;
+    const initial = (opts && opts.initial) || {};
+    const id = opts && opts.id;
+
+    const btn = document.createElement('button');
+    btn.className = 'hdm-like-btn' + (initial.liked ? ' liked' : '');
+    btn.innerHTML = `<span class="hdm-heart" aria-hidden="true">❤️</span>
+                     <span class="hdm-like-num">${Math.max(0, Number(initial.likes||0))}</span>`;
+
+    btn.addEventListener('click', async () => {
+      if (!id || typeof window.rpcToggleLike !== 'function') return;
+      if (btn.disabled) return;
+      btn.disabled = true;
+      try{
+        const res = await window.rpcToggleLike(id);
+        btn.classList.toggle('liked', !!res.liked_now);
+        const n = btn.querySelector('.hdm-like-num');
+        if (n) n.textContent = String(Math.max(0, Number(res.likes||0)));
+      } finally { btn.disabled = false; }
+    });
+
+    mount.replaceChildren(btn);
+    return btn;
+  }
+
+  window.DGMlikes = { renderButton };
+})();
 
 (async function(){ try{
   // ===== helpers, die dein Code unten erwartet =====
@@ -440,17 +486,67 @@ $('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click());
     if (skeleton) skeleton.style.display = 'none';
   }
 
-  function attachEdgeSwipeProfile(overlayEl){
-    if (!overlayEl) return;
-    const panel = overlayEl.querySelector('.hdm-detail-scroll') || overlayEl;
-    panel.style.willChange = 'transform';
-    let tracking = false, startX = 0, startY = 0, moved = false;
-    overlayEl.addEventListener('pointerdown', (e) => { if (e.clientX > 24) return; tracking = true; moved = false; startX = e.clientX; startY = e.clientY; panel.style.transition = 'none'; overlayEl.setPointerCapture?.(e.pointerId); });
-    overlayEl.addEventListener('pointermove', (e) => { if (!tracking) return; const dx = e.clientX - startX; const dy = Math.abs(e.clientY - startY); if (dy > 12 && Math.abs(dx) < 8) return; if (dx < 0) { panel.style.transform = `translateX(${dx * 0.2}px)`; moved = true; return; } e.preventDefault(); moved = true; panel.style.transform = `translateX(${dx}px)`; }, { passive: false });
-    function endPointer(e) { if (!tracking) return; tracking = false; overlayEl.releasePointerCapture?.(e.pointerId); panel.style.transition = 'transform .22s ease'; const dx = e.clientX - startX; if (moved && dx > 70) { panel.style.transform = 'translateX(100%)'; setTimeout(() => { panel.style.transform = ''; closeHdmDetailInProfile(); }, 180); } else { panel.style.transform = ''; } }
-    overlayEl.addEventListener('pointerup', endPointer);
-    overlayEl.addEventListener('pointercancel', endPointer);
+function attachEdgeSwipeProfile(overlayEl){
+  if (!overlayEl) return;
+  const panel = overlayEl.querySelector('.hdm-detail-scroll') || overlayEl;
+  panel.style.willChange = 'transform';
+
+  const EDGE=28, CLOSE_PX=80, CLOSE_RATIO=0.25, CLOSE_VX=0.65; // px/ms
+  let tracking=false, sx=0, sy=0, dx=0, moved=false, lastX=0, lastT=0, vx=0;
+
+  overlayEl.addEventListener('pointerdown', (e)=>{
+    if (e.clientX > EDGE) return;             // nur linker Rand
+    tracking=true; moved=false;
+    sx=e.clientX; sy=e.clientY; dx=0;
+    lastX=sx; lastT=performance.now(); vx=0;
+    panel.style.transition='none';
+    overlayEl.setPointerCapture?.(e.pointerId);
+  }, {passive:true});
+
+  overlayEl.addEventListener('pointermove', (e)=>{
+    if (!tracking) return;
+    dx = e.clientX - sx;
+    const dy = Math.abs(e.clientY - sy);
+
+    // vertikales Scrollen erlauben, wenn fast kein X-Move
+    if (dy > 14 && Math.abs(dx) < 10) return;
+
+    if (dx < 0){                               // nach links → nur minimaler Parallax
+      panel.style.transform = `translateX(${dx*0.2}px)`;
+      moved = true;
+      return;
+    }
+
+    e.preventDefault();                        // horizontaler Swipe übernimmt
+    moved = true;
+
+    const now = performance.now();
+    vx = (e.clientX - lastX) / Math.max(1, now - lastT);  // px/ms
+    lastX = e.clientX; lastT = now;
+
+    panel.style.transform = `translateX(${dx}px)`;
+  }, {passive:false});
+
+  function end(e){
+    if (!tracking) return;
+    tracking=false;
+    overlayEl.releasePointerCapture?.(e.pointerId);
+
+    const width = panel.clientWidth || window.innerWidth;
+    const shouldClose = moved && (dx > CLOSE_PX || (dx/width) > CLOSE_RATIO || vx > CLOSE_VX);
+
+    panel.style.transition = 'transform .22s ease';
+    if (shouldClose){
+      panel.style.transform = 'translateX(100%)';
+      setTimeout(()=>{ panel.style.transform=''; closeHdmDetailInProfile(); }, 180);
+    } else {
+      panel.style.transform = '';
+    }
   }
+  overlayEl.addEventListener('pointerup', end);
+  overlayEl.addEventListener('pointercancel', end);
+}
+
 
   window.addEventListener('pagehide', closeHdmDetailInProfile);
   window.addEventListener('beforeunload', closeHdmDetailInProfile);
@@ -491,13 +587,29 @@ $('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click());
   (async ()=>{
     const [ms, sb] = await Promise.all([getMS(), getSB()]);
     console.log('[DM] MS/SB ready?', { ms: !!ms, sb: !!(sb && sb.from) });
-    let myId=null,myCF={};
-    if(ms){ const me=await getMemberNormalized(ms); myId=me.id; myCF=me.cf||{}; }
-    window._DM_MY_ID = myId || null;
-    const profileUid = myId;
-    hydrate(myCF, true);
-    await loadPostsFor(profileUid);
-    
+let myId = null, myCF = {};
+
+if (ms) {
+  const me = await getMemberNormalized(ms);
+  myId = me.id;
+  myCF = me.cf || {};
+}
+
+const urlUid = new URLSearchParams(location.search).get('uid');
+window._DM_MY_ID = myId || null;
+
+const profileUid = urlUid || myId;                  // ← wichtig: fremde Profile anzeigen
+const isOwner    = String(profileUid) === String(myId);
+
+hydrate(isOwner ? myCF : {}, isOwner);              // ← nur beim eigenen Profil eigene CF hydraten
+await loadPostsFor(profileUid);
+
+// (optional) DGMlikes initialisieren, falls externes Modul vorhanden:
+if (window.DGMlikes && typeof window.DGMlikes.init === 'function') {
+  try { await window.DGMlikes.init(); } catch(e){ console.warn('[DGMlikes init]', e); }
+}
+
+
 // DGMlikes Modul initialisieren (falls vorhanden)
     if (window.DGMlikes && typeof window.DGMlikes.init === 'function') {
       try {
@@ -553,7 +665,62 @@ $('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click());
       username = document.createElement('span'); username.className='hdm-caption-username'; username.textContent = hundename; row.append(username, wrap); wrap.appendChild(text); if(text.textContent.trim()){ text.classList.add('caption-truncate'); requestAnimationFrame(()=>{ const clamped = text.scrollHeight > text.clientHeight + 1; if(!clamped) text.classList.remove('caption-truncate'); else{ const t=document.createElement('button'); t.className='caption-more-btn'; t.textContent='mehr'; let expanded=false; t.onclick=()=>{ expanded=!expanded; text.classList.toggle('caption-truncate', !expanded); t.textContent=expanded?'weniger':'mehr'; }; wrap.appendChild(t); } }); } }
     function pg_editCaption(item){ const row = document.getElementById('pg-detail-caption-row'); const old = row.textContent?.trim() ? row.querySelector('.hdm-caption-text')?.textContent || '' : ''; row.innerHTML = `<textarea id="pg-caption-input" rows="2" placeholder="Beschreibe das Bild...">${old||''}</textarea><button class="caption-save-btn" id="pg-caption-save">Speichern</button>`; document.getElementById('pg-caption-save').onclick = async ()=>{ const val = (document.getElementById('pg-caption-input').value||'').trim(); await pg_saveCaption(item, val); await pg_renderCaption(item); }; }
 
-    function attachEdgeSwipePG(overlayEl, onDismiss, scrollSelector){ if (!overlayEl) return; const panel = overlayEl.querySelector(scrollSelector) || overlayEl; panel.style.willChange = 'transform'; let tracking=false, startX=0, startY=0, moved=false; overlayEl.addEventListener('pointerdown', (e)=>{ if (e.clientX > 24) return; tracking=true; moved=false; startX=e.clientX; startY=e.clientY; panel.style.transition='none'; overlayEl.setPointerCapture?.(e.pointerId); }); overlayEl.addEventListener('pointermove', (e)=>{ if(!tracking) return; const dx = e.clientX - startX, dy = Math.abs(e.clientY - startY); if (dy > 12 && Math.abs(dx) < 8) return; if (dx < 0){ panel.style.transform=`translateX(${dx*0.2}px)`; moved=true; return; } e.preventDefault(); moved=true; panel.style.transform = `translateX(${dx}px)`; }, {passive:false}); function end(e){ if(!tracking) return; tracking=false; overlayEl.releasePointerCapture?.(e.pointerId); panel.style.transition='transform .22s ease'; const dx = e.clientX - startX; if (moved && dx > 70){ panel.style.transform='translateX(100%)'; setTimeout(()=>{ panel.style.transform=''; onDismiss(); }, 180); } else { panel.style.transform=''; } } overlayEl.addEventListener('pointerup', end); overlayEl.addEventListener('pointercancel', end); }
+function attachEdgeSwipePG(overlayEl, onDismiss, scrollSelector){
+  if (!overlayEl) return;
+  const panel = overlayEl.querySelector(scrollSelector) || overlayEl;
+  panel.style.willChange = 'transform';
+
+  const EDGE=28, CLOSE_PX=80, CLOSE_RATIO=0.25, CLOSE_VX=0.65;
+  let tracking=false, sx=0, sy=0, dx=0, moved=false, lastX=0, lastT=0, vx=0;
+
+  overlayEl.addEventListener('pointerdown', (e)=>{
+    if (e.clientX > EDGE) return;
+    tracking=true; moved=false;
+    sx=e.clientX; sy=e.clientY; dx=0;
+    lastX=sx; lastT=performance.now(); vx=0;
+    panel.style.transition='none';
+    overlayEl.setPointerCapture?.(e.pointerId);
+  }, {passive:true});
+
+  overlayEl.addEventListener('pointermove', (e)=>{
+    if (!tracking) return;
+    dx = e.clientX - sx;
+    const dy = Math.abs(e.clientY - sy);
+    if (dy > 14 && Math.abs(dx) < 10) return;
+
+    if (dx < 0){
+      panel.style.transform = `translateX(${dx*0.2}px)`;
+      moved=true; return;
+    }
+
+    e.preventDefault();
+    moved=true;
+
+    const now=performance.now();
+    vx = (e.clientX - lastX) / Math.max(1, now - lastT);
+    lastX=e.clientX; lastT=now;
+
+    panel.style.transform = `translateX(${dx}px)`;
+  }, {passive:false});
+
+  function end(e){
+    if (!tracking) return; tracking=false;
+    overlayEl.releasePointerCapture?.(e.pointerId);
+
+    const width = panel.clientWidth || window.innerWidth;
+    const shouldClose = moved && (dx > CLOSE_PX || (dx/width) > CLOSE_RATIO || vx > CLOSE_VX);
+
+    panel.style.transition='transform .22s ease';
+    if (shouldClose){
+      panel.style.transform='translateX(100%)';
+      setTimeout(()=>{ panel.style.transform=''; onDismiss && onDismiss(); }, 180);
+    } else {
+      panel.style.transform='';
+    }
+  }
+  overlayEl.addEventListener('pointerup', end);
+  overlayEl.addEventListener('pointercancel', end);
+}
 
     window.openProfilePhotoDetail = openProfilePhotoDetail;
     window.closeProfilePhotoDetail = closeProfilePhotoDetail;
