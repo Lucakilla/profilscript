@@ -1,49 +1,180 @@
-// ---- DGMlikes Fallback (GANZ OBEN in dieselbe JS-Datei setzen) ----
-(function () {
-  if (window.DGMlikes) return;
+/* === DGM mini polyfill (ganz oben einfügen; keine <script>-Tags in .js) === */
+(function(){
+  if(!window.waitFor){
+    window.waitFor = function(check, {tries=240, delay=50}={}){
+      return new Promise(res=>{
+        let n=0; (function loop(){
+          const v = check();
+          if(v!==null && v!==undefined) return res(v);
+          if(++n>=tries) return res(null);
+          setTimeout(loop, delay);
+        })();
+      });
+    };
+  }
 
-  const CSS = `
-    .hdm-like-btn{display:inline-flex;align-items:center;gap:.4rem;border:0;background:transparent;
-      font:inherit;cursor:pointer;padding:.25rem .4rem;border-radius:12px;user-select:none}
-    .hdm-like-btn .hdm-heart{display:inline-block;transform:translateY(1px)}
-    .hdm-like-btn.liked .hdm-heart{filter: drop-shadow(0 0 0 rgba(0,0,0,.1))}
-    .hdm-like-num{min-width:1.2em;text-align:right}
-  `;
-  function injectCss(){
-    if (document.getElementById('dgm-likes-css')) return;
-    const s=document.createElement('style'); s.id='dgm-likes-css'; s.textContent=CSS;
+  // lazy helpers
+  async function _getMS(){
+    const ms = await waitFor(()=> window.$memberstackDom || window.Memberstack?.DOM || window.Memberstack);
+    if(!ms) return null;
+    if(ms.getCurrentMember || ms?.memberstack?.getCurrentMember) return ms;
+    return null;
+  }
+  async function _getSB(){
+    const ready = await waitFor(()=> window.supabaseClient || window._supabase || window.SUPABASE || window.sb || window.supabase);
+    if(ready?.from && ready?.storage) return ready;
+    const ns = window.supabase;
+    const metaUrl = document.querySelector('meta[name="supabase-url"]')?.content;
+    const metaKey = document.querySelector('meta[name="supabase-key"]')?.content;
+    const ds  = document.querySelector('[data-sb-url][data-sb-key]') || document.body;
+    const url = window.SUPABASE_URL || ds?.dataset?.sbUrl || metaUrl || null;
+    const key = window.SUPABASE_ANON_KEY || ds?.dataset?.sbKey || metaKey || null;
+    if(ns?.createClient && url && key){
+      try{ const c = ns.createClient(url,key); window.supabaseClient = c; return c; }catch(_){}
+    }
+    return null;
+  }
+  async function _getMemberId(){
+    try{
+      const ms = await _getMS();
+      const getter = ms?.getCurrentMember || ms?.memberstack?.getCurrentMember;
+      const res = getter ? await getter() : null;
+      const data = res?.data || res || {};
+      const m = data.member || data || {};
+      return m.id || data.id || null;
+    }catch(_){ return null; }
+  }
+
+  function _injectLikesCss(){
+    if(document.getElementById('dgm-likes-css')) return;
+    const s=document.createElement('style');
+    s.id='dgm-likes-css';
+    s.textContent=`
+      .hdm-like-btn{display:inline-flex;align-items:center;gap:.4rem;border:0;background:transparent;
+        font:inherit;cursor:pointer;padding:.25rem .5rem;border-radius:12px;user-select:none}
+      .hdm-like-btn .hdm-heart{display:inline-block;transform:translateY(1px)}
+      .hdm-like-btn.liked .hdm-heart{filter:drop-shadow(0 0 0 rgba(0,0,0,.1))}
+      .hdm-like-num{min-width:1.2em;text-align:right;font-weight:800}
+    `;
     document.head.appendChild(s);
   }
 
-  function renderButton(mount, opts){
-    injectCss();
-    if (!mount) return null;
-    const initial = (opts && opts.initial) || {};
-    const id = opts && opts.id;
+  async function _toggleLikeGeneric(ref, type='hdm'){
+    const sb  = await _getSB();
+    const uid = await _getMemberId();
+    if(!sb || !uid || !ref) return { liked_now:false, likes:0 };
 
-    const btn = document.createElement('button');
-    btn.className = 'hdm-like-btn' + (initial.liked ? ' liked' : '');
-    btn.innerHTML = `<span class="hdm-heart" aria-hidden="true">❤️</span>
-                     <span class="hdm-like-num">${Math.max(0, Number(initial.likes||0))}</span>`;
-
-    btn.addEventListener('click', async () => {
-      if (!id || typeof window.rpcToggleLike !== 'function') return;
-      if (btn.disabled) return;
-      btn.disabled = true;
+    if(type==='hdm'){
+      const { data: ex } = await sb
+        .from('hund_des_monats_likes')
+        .select('id')
+        .eq('bild_id', ref)
+        .eq('memberstack_id', uid)
+        .maybeSingle();
+      if(ex){ await sb.from('hund_des_monats_likes').delete().eq('id', ex.id); }
+      else  { await sb.from('hund_des_monats_likes').insert({ bild_id: ref, memberstack_id: uid }); }
+      const { count } = await sb
+        .from('hund_des_monats_likes')
+        .select('*', { count:'exact', head:true })
+        .eq('bild_id', ref);
+      return { liked_now: !ex, likes: count||0 };
+    }else{
+      // Profil-Galerie (ref ist "uid/filename")
+      const key = String(ref);
+      const { data: exlist } = await sb
+        .from('profile_gallery_likes')
+        .select('id,file_ref,ref')
+        .or(`file_ref.eq.${key},ref.eq.${key}`)
+        .eq('memberstack_id', uid)
+        .limit(1);
+      const ex = Array.isArray(exlist) && exlist[0];
+      if(ex){
+        await sb.from('profile_gallery_likes').delete().eq('id', ex.id);
+      }else{
+        const row = { memberstack_id: uid };
+        let ok=false;
+        try{ await sb.from('profile_gallery_likes').insert(Object.assign({}, row, { file_ref:key })); ok=true; }catch(_){}
+        if(!ok){ try{ await sb.from('profile_gallery_likes').insert(Object.assign({}, row, { ref:key })); ok=true; }catch(_){} }
+      }
+      let cnt=0;
       try{
-        const res = await window.rpcToggleLike(id);
-        btn.classList.toggle('liked', !!res.liked_now);
-        const n = btn.querySelector('.hdm-like-num');
-        if (n) n.textContent = String(Math.max(0, Number(res.likes||0)));
-      } finally { btn.disabled = false; }
-    });
-
-    mount.replaceChildren(btn);
-    return btn;
+        const { count } = await sb
+          .from('profile_gallery_likes')
+          .select('*', { count:'exact', head:true })
+          .or(`file_ref.eq.${key},ref.eq.${key}`);
+        cnt = count||0;
+      }catch(_){}
+      return { liked_now: !ex, likes: cnt };
+    }
   }
 
-  window.DGMlikes = { renderButton };
+  async function _fetchCount(ref, type='hdm'){
+    const sb = await _getSB();
+    if(!sb || !ref) return 0;
+    try{
+      if(type==='hdm'){
+        const { count } = await sb.from('hund_des_monats_likes')
+          .select('*', { count:'exact', head:true })
+          .eq('bild_id', ref);
+        return count||0;
+      }else{
+        const key = String(ref);
+        const { count } = await sb.from('profile_gallery_likes')
+          .select('*', { count:'exact', head:true })
+          .or(`file_ref.eq.${key},ref.eq.${key}`);
+        return count||0;
+      }
+    }catch(_){ return 0; }
+  }
+
+  // global rpc fallback (unterstützt zweiten arg 'type')
+  if(typeof window.rpcToggleLike !== 'function'){
+    window.rpcToggleLike = (ref, type='hdm') => _toggleLikeGeneric(ref, type);
+  }
+
+  // DGMlikes minimal
+  if(!window.DGMlikes){
+    window.DGMlikes = {
+      init: async ()=>{ _injectLikesCss(); return true; },
+      renderButton(mount, opts){
+        _injectLikesCss();
+        if(!mount) return null;
+        const type = (opts && opts.type) || 'hdm';
+        const id   = opts && opts.id;
+        const initial = (opts && opts.initial) || {};
+
+        const btn = document.createElement('button');
+        btn.type='button';
+        btn.className = 'hdm-like-btn' + (initial.liked ? ' liked' : '');
+        btn.innerHTML = `<span class="hdm-heart" aria-hidden="true">❤️</span>
+                         <span class="hdm-like-num">${Math.max(0, Number(initial.likes||0))}</span>`;
+
+        // wenn keine initial likes übergeben wurden, einmalig laden
+        if(initial.likes == null){
+          _fetchCount(id, type).then(c=>{
+            const n = btn.querySelector('.hdm-like-num');
+            if(n) n.textContent = String(c);
+          }).catch(()=>{});
+        }
+
+        btn.addEventListener('click', async ()=>{
+          if(btn.disabled) return;
+          btn.disabled = true;
+          try{
+            const res = await (window.rpcToggleLike ? window.rpcToggleLike(id, type) : _toggleLikeGeneric(id, type));
+            btn.classList.toggle('liked', !!res.liked_now);
+            const n = btn.querySelector('.hdm-like-num');
+            if(n) n.textContent = String(Math.max(0, Number(res.likes||0)));
+          }finally{ btn.disabled = false; }
+        });
+
+        mount.replaceChildren(btn);
+        return btn;
+      }
+    };
+  }
 })();
+
 
 (async function(){ try{
   // ===== helpers, die dein Code unten erwartet =====
