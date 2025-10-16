@@ -1,6 +1,6 @@
 
 
-<script>
+
 (async function(){ try{
   // ===== helpers, die dein Code unten erwartet =====
 const APP_HOME = '/rezepte';
@@ -1176,5 +1176,5 @@ if (!window.rpcToggleLike) {
 }
 
 })();
-</script>
+
 
