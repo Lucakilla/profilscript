@@ -1,1 +1,1180 @@
-<script> (async function(){ try{ // ===== helpers, die dein Code unten erwartet ===== const APP_HOME = '/rezepte'; const $ = (s,r=document)=>r.querySelector(s); const $$ = (s,r=document)=>Array.from(r.querySelectorAll(s)); /** Warten bis Objekte da sind (robust, ~12s Timeout) */ function waitFor(check, { tries = 240, delay = 50 } = {}) { return new Promise(res => { let n = 0; (function loop(){ const v = check(); if (v !== null && v !== undefined) return res(v); if (++n >= tries) return res(null); setTimeout(loop, delay); })(); }); } /** Memberstack v1/v2 sicher greifen (DOM/$memberstackDom) */ async function getMS(){ return await waitFor(() => { const ms1 = window.$memberstackDom; const ms2 = window.Memberstack?.DOM || window.Memberstack; const ms = ms1 || ms2 || null; if (!ms) return null; // nur „echte“ Instanzen zurückgeben if (ms.getCurrentMember || ms?.memberstack?.getCurrentMember) return ms; return null; }, { tries: 240, delay: 50 }); } /** Supabase-CLIENT sicherstellen (existierend nutzen oder neu bauen) */ async function getSB(){ return await waitFor(() => { // a) bereits erzeugter Client? const ready = window.supabaseClient || window._supabase || window.SUPABASE || window.sb || null; if (ready?.from && ready?.storage) return ready; // b) manchmal liegt der Client direkt unter window.supabase if (window.supabase?.from && window.supabase?.storage) return window.supabase; // c) sonst aus Namespace bauen (URL/Key aus Meta, data-Attr oder globalen Variablen) const ns = window.supabase; const metaUrl = document.querySelector('meta[name="supabase-url"]')?.content; const metaKey = document.querySelector('meta[name="supabase-key"]')?.content; const dsEl = document.querySelector('[data-sb-url][data-sb-key]') || document.body; const url = window.SUPABASE_URL || dsEl?.dataset?.sbUrl || metaUrl || null; const key = window.SUPABASE_ANON_KEY || dsEl?.dataset?.sbKey || metaKey || null; if (ns?.createClient && url && key){ try{ const client = ns.createClient(url, key); window.supabaseClient = client; // einheitlich global ablegen return client; }catch(e){ console.warn('[SB] createClient failed', e); } } return null; }, { tries: 240, delay: 50 }); } /** Normalisierte Member-Daten (funktioniert mit MS v1/v2) */ async function getMemberNormalized(ms){ try{ const getter = ms?.getCurrentMember || ms?.memberstack?.getCurrentMember; const res = getter ? await getter() : null; const data = res?.data || res || {}; const member = data.member || data || {}; return { id: member.id || data.id || null, cf: member.customFields || data.customFields || {} }; }catch(err){ console.warn('[MS] getMemberNormalized failed', err); return { id:null, cf:{} }; } } // NEU: Bild-Fallback (gegen weiße Kacheln) function wireImgFallback(img){ if(!img) return; img.loading = 'lazy'; img.decoding='async'; let retried=false; img.onerror=()=>{ if(retried){ img.src='https://via.placeholder.com/900x900.png?text=Doggo'; return; } retried=true; try{ const u=new URL(img.src, location.origin); u.searchParams.set('v', Date.now()); img.src=u.toString(); } catch(_){ img.src = img.src + ((img.src||'').includes('?')?'&':'?') + 'v='+Date.now(); } }; } // NEU: kleine Cache-Helfer (Profil-Posts) const CACHE_TTL_MS = 90*1000; function cacheKey(uid){ return DM_POSTS_CACHE:${uid}; } function getCachedPosts(uid){ try{ const raw=sessionStorage.getItem(cacheKey(uid)); if(!raw) return null; const {ts,items}=JSON.parse(raw); if(!Array.isArray(items)) return null; if(Date.now()-ts > CACHE_TTL_MS) return null; return items; }catch(_){ return null; } } function setCachedPosts(uid, items){ try{ sessionStorage.setItem(cacheKey(uid), JSON.stringify({ts:Date.now(), items:items||[]})); }catch(_){} } // NEU: Cache-Helfer (Profil-Galerie) const GALLERY_CACHE_TTL_MS = 90*1000; function galleryKey(uid){ return DM_GALLERY_CACHE:${uid}; } function getCachedGallery(uid){ try{ const raw = sessionStorage.getItem(galleryKey(uid)); if(!raw) return null; const { ts, items } = JSON.parse(raw); if(!Array.isArray(items)) return null; if(Date.now() - ts > GALLERY_CACHE_TTL_MS) return null; return items; }catch(_){ return null; } } function setCachedGallery(uid, items){ try{ sessionStorage.setItem(galleryKey(uid), JSON.stringify({ ts:Date.now(), items:items||[] })); }catch(_){} } function clearCachedGallery(uid){ try{ sessionStorage.removeItem(galleryKey(uid)); }catch(_){} } function ageFrom(s){ if(!s) return {label:'–'}; const d=new Date(s), n=new Date(); let m=(n.getFullYear()-d.getFullYear())*12+(n.getMonth()-d.getMonth()); if(n.getDate()<d.getDate()) m--; return m<24?{label:${m} Mon.}:{label:${Math.floor(m/12)} J.}; } function fmtDateDE(s){ if(!s) return '–'; const d=new Date(s); if(isNaN(d)) return '–'; const dd=String(d.getDate()).padStart(2,'0'); const mm=String(d.getMonth()+1).padStart(2,'0'); return ${dd}.${mm}.${d.getFullYear()}; } function setPrivacy(isOwner){ $$('.dm2-private').forEach(el=>el.classList.toggle('hidden', !isOwner)); } // Gleicher Compressor wie im HDM window.compressImage = async function(file, { maxW = 1600, maxH = 1600, targetBytes = 600 * 1024, // Ziel 400–600 KB qualityMin = 0.5, qualityMax = 0.9, minW = 900, minH = 900, mimePreferred = 'image/webp' } = {}) { let src; try { src = await createImageBitmap(file); } catch { src = await new Promise((resolve, reject) => { const url = URL.createObjectURL(file); const img = new Image(); img.onload = () => { URL.revokeObjectURL(url); resolve(img); }; img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); }; img.src = url; }); } const ratio = Math.min(1, maxW/src.width, maxH/src.height); const baseW = Math.max(1, Math.round(src.width*ratio)); const baseH = Math.max(1, Math.round(src.height*ratio)); const canvas = document.createElement('canvas'); function draw(w,h){ canvas.width=w; canvas.height=h; const ctx = canvas.getContext('2d',{alpha:false}); ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h); ctx.drawImage(src,0,0,w,h); } async function encode(type,q){ const blob = await new Promise(res=>canvas.toBlob(res, type, q)); if (!blob) return null; if (type && blob.type && blob.type!==type) return null; return blob; } const supportsWebP = (()=>{ try{ return canvas.toDataURL('image/webp').startsWith('data:image/webp'); }catch{ return false; } })(); const encoders=[]; if (mimePreferred==='image/webp' && supportsWebP) encoders.push('image/webp'); encoders.push('image/jpeg'); const nameWith = (name,type)=> name.replace(/\.(heic|heif|png|jpe?g|webp|avif)$/i,'') + (type==='image/webp'?'.webp':'.jpg'); draw(baseW, baseH); for (const type of encoders){ let lo=qualityMin, hi=qualityMax, best=null; for(let i=0;i<8;i++){ const q=(lo+hi)/2, b=await encode(type,q); if(!b){ best=null; break; } if(b.size<=targetBytes){ best=b; lo=q; } else { hi=q; } } if(best) return new File([best], nameWith(file.name,type), { type }); let w=baseW,h=baseH; for(let s=0;s<6 && (w>minW||h>minH); s++){ w=Math.max(minW,Math.round(w*0.85)); h=Math.max(minH,Math.round(h*0.85)); draw(w,h); let lo2=qualityMin, hi2=qualityMax, best2=null; for(let j=0;j<6;j++){ const q=(lo2+hi2)/2, b=await encode(type,q); if(!b){ best2=null; break; } if(b.size<=targetBytes){ best2=b; lo2=q; } else { hi2=q; } } if(best2) return new File([best2], nameWith(file.name,type), { type }); } const last = await encode(type, qualityMin); if (last && last.size < file.size * 0.95) return new File([last], nameWith(file.name,type), { type }); draw(baseW, baseH); } return null; }; // Warten bis alle nötigen Knoten vorhanden sind const _need=['dm2Profile','dm2HdmGrid','dm2GalleryGrid','dm2Modal']; const _ok = await waitFor(()=> _need.every(id=>document.getElementById(id))); if(!_ok){ const miss=_need.filter(id=>!document.getElementById(id)); console.warn('[DM] fehlende IDs → Abbruch:', miss); return; } const ui={ cover:$('#dm2Cover'), coverFile:$('#dm2FileCover'), avatarImg:$('#dm2Avatar'), file:$('#dm2File'), name:$('#dm2Name'), handle:$('#dm2Handle'), bio:$('#dm2Bio'), age:$('#dm2Age'), breed:$('#dm2Breed'), statsPosts:$('#dm2PostsCount'), followers:$('#dm2Followers'), following:$('#dm2Following'), gear:$('#dm2Gear'), share:$('#dm2Share'), menu:$('#dm2Menu'), followBtn:$('#dm2FollowBtn'), membership:$('#dm2Membership'), logout:$('#dm2Logout'), editBtn:$('#dm2EditBtn'), editAvatarBtn:$('#dm2EditAvatar'), tabs:$$('.dm2-tab'), hdmSection:$('#dm2HdmSection'), hdmGrid:$('#dm2HdmGrid'), galleryGrid:$('#dm2GalleryGrid'), galleryAdd:$('#dm2GalleryAdd'), galleryFile:$('#dm2GalleryFile'), ab:{name:$('#ab2Name'),sex:$('#ab2Sex'),birth:$('#ab2Birth'),age:$('#ab2Age'),breed:$('#ab2Breed'),weight:$('#ab2Weight'),goal:$('#ab2Goal'),allergies:$('#ab2Allergies')}, modal:$('#dm2Modal'), sheet:$('#dm2Sheet'), in:{bio:$('#in2Bio'),weight:$('#in2Weight'),neutered:$('#in2Neutered'),birth:$('#in2Birth'),goal:$('#in2Goal')}, bioCount:$('#bioCount'), tagWrap:$('#in2Tags'), tagInput:$('#in2TagInput'), suggest:$('#in2Suggest'), photo:$('#dm2Photo'), photoImg:$('#dm2PhotoImg'), fModal:$('#dm2FollowModal'), fTitle:$('#fTitle'), listFollowers:$('#listFollowers'), listFollowing:$('#listFollowing'), openFollowers:$('#openFollowers'), openFollowing:$('#openFollowing'), closeFollowModal:$('#closeFollowModal') }; ui.tabs.forEach(t=>t.addEventListener('click',()=>{ ui.tabs.forEach(x=>x.classList.remove('active')); t.classList.add('active'); $$('.dm2-panel').forEach(p=>p.classList.remove('active')); $('#dm2Tab-'+t.dataset.tab).classList.add('active'); })); /* --- Menüs / Logout --- */ $('#dm2Gear')?.addEventListener('click',(e)=>{e.stopPropagation();ui.menu.classList.toggle('open');}); $('#dm2Membership')?.addEventListener('click',()=>window.$memberstackDom?.openModal?.('update-subscription')); $('#dm2Logout')?.addEventListener('click',async()=>{try{await window.$memberstackDom?.logout?.();}catch(_){}location.reload();}); $('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click()); /* --- Allergie-Auswahl --- */ const optionsList=["Rind","Huhn","Lamm","Pferd","Kaninchen","Ente","Truthahn","Wild","Fisch","Lachs","Forelle","Thunfisch","Ei","Milchprodukte","Laktose","Gluten","Weizen","Reis","Mais","Hafer","Gerste","Kartoffel","Süßkartoffel","Kürbis","Zucchini","Karotte","Erbsen","Linsen","Bohnen","Rote Bete","Brokkoli","Fenchel","Pastinake","Topinambur","Birne","Apfel","Banane","Heidelbeeren","Cranberries","Kokos","Leinöl","Lachsöl","Hanfsamen","Flohsamen","Chiasamen","Hirse","Quinoa","Amaranth","Ziegenmilch","Petersilie","Brennnessel","Löwenzahn","Bierhefe","Algen","Eierschale","Joghurt"]; let selectedTags=[]; function renderTags(){ ui.tagWrap.innerHTML=''; selectedTags.forEach(txt=>{const s=document.createElement('span'); s.className='dm2-tag'; s.textContent=txt; const x=document.createElement('span'); x.className='x'; x.textContent='×'; x.onclick=()=>{selectedTags=selectedTags.filter(t=>t!==txt);renderTags();}; s.appendChild(x); ui.tagWrap.appendChild(s); });} ui.tagInput.addEventListener('input',()=>{const v=ui.tagInput.value.toLowerCase().trim(); const c=optionsList.filter(o=>o.toLowerCase().includes(v)&&!selectedTags.includes(o)); ui.suggest.innerHTML=''; if(!v||!c.length){ui.suggest.style.display='none';return;} c.slice(0,8).forEach(o=>{const li=document.createElement('li');li.textContent=o;li.onclick=()=>{selectedTags.push(o);renderTags();ui.tagInput.value='';ui.suggest.style.display='none';}; ui.suggest.appendChild(li);}); ui.suggest.style.display='block';}); // Beim Fokus den Sheet-Scroller nach unten fahren, damit Suggest + Tastatur sichtbar sind ui.tagInput.addEventListener('focus', ()=>{ const sheet = ui.sheet; if(!sheet) return; sheet.scrollTo({ top: sheet.scrollHeight, behavior:'smooth' }); }); document.addEventListener('click',(e)=>{ if(ui.tagInput && ui.suggest && !ui.tagInput.contains(e.target) && !ui.suggest.contains(e.target)) ui.suggest.style.display='none'; }); /* --- UI füllen --- */ function hydrate(cf={}, isOwner=false){ const name=cf.hundename||cf.name||'Dein Hund'; ui.name.textContent=name; ui.handle.textContent='@'+(name?name.toLowerCase().replace(/\s+/g,'_'):'doggo'); if(cf.profilbild) ui.avatarImg.src=cf.profilbild; if(cf.profilcover) ui.cover.style.backgroundImage=url("${cf.profilcover}"); ui.age.textContent=ageFrom(cf.geburtstag).label; ui.breed.textContent=cf.rasse||'Lieblingsfell'; const bio=cf.bio?String(cf.bio):''; ui.bio.textContent=bio; ui.bio.style.display=bio?'block':'none'; ui.ab.name.textContent=name; ui.ab.sex.textContent=cf.geschlecht||'–'; ui.ab.birth.textContent=fmtDateDE(cf.geburtstag); ui.ab.age.textContent=ageFrom(cf.geburtstag).label; ui.ab.breed.textContent=cf.rasse||'–'; ui.ab.weight.textContent=cf.gewicht?${cf.gewicht} kg:'–'; ui.ab.goal.textContent=cf.endgewicht?${cf.endgewicht} kg:'–'; const arr=Array.isArray(cf.allergien)?cf.allergien:(cf.allergien?String(cf.allergien).split(',').map(s=>s.trim()).filter(Boolean):[]); ui.ab.allergies.textContent=arr.length?arr.join(', '):'–'; ui.in.bio.value=bio; ui.in.weight.value=cf.gewicht||''; ui.in.neutered.value=cf.kastriert||''; ui.in.birth.value=cf.geburtstag||''; ui.in.goal.value=cf.endgewicht||''; selectedTags=arr.slice(); renderTags(); setPrivacy(isOwner); } $('.dm2-avatar')?.addEventListener('click', ()=>{ $('#dm2PhotoImg').src=ui.avatarImg.src; $('#dm2Photo').classList.add('open'); document.body.classList.add('dm2-lock'); }); $('#dm2Photo')?.addEventListener('click',(e)=>{ if(e.target.id==='dm2Photo') { e.currentTarget.classList.remove('open'); document.body.classList.remove('dm2-lock'); } }); /* === POSTS LADEN – HDM + PROFIL-GALERIE (mit Bugfix für Klick-Navigation) === */ /* Likes sammeln (Count + ob Viewer geliked hat) ohne RPC */ async function enrichLikesWithoutRpc(sb, pics, viewerId){ try{ const ids = (pics||[]).map(p=>p.id).filter(Boolean); if (!sb || !ids.length) return pics; const { data: rows } = await sb .from('hund_des_monats_likes') .select('bild_id, memberstack_id') .in('bild_id', ids); const countMap = new Map(); const likedSet = new Set(); (rows||[]).forEach(r=>{ countMap.set(r.bild_id, (countMap.get(r.bild_id)||0)+1); if (viewerId && String(r.memberstack_id)===String(viewerId)) likedSet.add(r.bild_id); }); return (pics||[]).map(p => Object.assign({}, p, { likes: countMap.get(p.id)||0, liked: likedSet.has(p.id) })); }catch(_){ return pics; } } async function loadPostsFor(profileUid){ const sb = await getSB(); const hdmGrid = ui.hdmGrid; const hdmSection = ui.hdmSection; if(!hdmGrid || !hdmSection){ console.warn('[Profile] HDM-Container fehlt – lade nur Galerie.'); await loadGalleryFor(profileUid); return; } hdmGrid.innerHTML = ''; // Cache (nur für HDM) const cached = getCachedPosts(profileUid); if (cached && cached.length) renderHdmGrid(cached); if (!sb || !profileUid){ if (!cached?.length){ hdmSection.style.display = 'none'; } // Galerie separat laden await loadGalleryFor(profileUid); return; } let pics = []; try{ const r1 = await sb.from('hund_des_monats') .select('id,bild_url,hundename,memberstack_id,member_id,owner_id,uid,created_at') .or(memberstack_id.eq.${profileUid},member_id.eq.${profileUid},owner_id.eq.${profileUid},uid.eq.${profileUid}) .order('created_at',{ascending:false}); pics = r1.data || []; // Fallback: wenn nach RPC-Merge noch keine likes/liked vorhanden -> lokal anreichern try{ const ms = await getMS(); const me = ms ? await getMemberNormalized(ms) : { id:null }; const viewerId = me?.id || null; const missing = !(pics||[]).some(p => ('likes' in p) || ('liked' in p)); if (missing) pics = await enrichLikesWithoutRpc(sb, pics, viewerId); }catch(_){} if(!pics.length){ const likePattern = %${profileUid}_%; const r2 = await sb.from('hund_des_monats') .select('id,bild_url,hundename,created_at') .like('bild_url', likePattern) .order('created_at',{ascending:false}); pics = r2.data || []; } if(!pics.length && sb.rpc){ try{ const r3 = await sb.rpc('get_hund_des_monats_with_likes', { p_memberstack_id: profileUid }); const all = r3?.data || []; pics = all.filter(p => [p.memberstack_id,p.member_id,p.owner_id,p.uid].filter(Boolean).map(String).includes(String(profileUid))); }catch(_){} } }catch(e){ console.warn('[HDM posts ERROR]', e); } setCachedPosts(profileUid, pics); renderHdmGrid(pics); // Profil-Galerie laden const galleryCount = await loadGalleryFor(profileUid); // Gesamtzähler: HDM + Galerie try{ ui.statsPosts.textContent = String((pics?.length||0) + (galleryCount||0)); }catch{} function renderHdmGrid(items){ hdmGrid.innerHTML = ''; if(!items.length){ hdmSection.style.display = 'none'; return; } hdmSection.style.display = ''; items.forEach(p=>{ const id = p.id; const url = p.bild_url; const name = p.hundename || 'Doggo'; const postKey = (id!=null) ? String(id) : url; const card = document.createElement('div'); card.className = 'dm2-card'; card.innerHTML = <img src="${url}" alt="${name}"> <div class="hdm-name-like-row"> <div class="hdm-dogname">${name}</div> <button class="hdm-likes${p.liked ? ' liked' : ''}" data-id="${id ?? ''}" title="Gefällt mir" type="button"> <span class="heart"> <svg class="heart-outline" viewBox="0 0 24 24" width="23" height="23" aria-hidden="true"> <path d="M12 21c-.6 0-1.2-.21-1.65-.62C6.05 17.17 2 13.39 2 9.5 2 6.42 4.42 4 7.5 4c1.74 0 3.41.81 4.5 2.09C13.09 4.81 14.76 4 16.5 4 19.58 4 22 6.42 22 9.5c0 3.89-4.05 7.67-8.35 10.88-.45.41-1.05.62-1.65.62z" stroke="#d77f47" stroke-width="2.1" fill="none"/> </svg> </span> <span class="hdm-like-num">${window.getLikes ? window.getLikes(p) : (p.likes||0)}</span> </button> </div> ; const img = card.querySelector('img'); wireImgFallback?.(img); // Ganze Karte klickbar; Like-Button ausnehmen card.style.cursor = 'pointer'; card.addEventListener('click', (e)=>{ const el = (e.target instanceof Element) ? e.target : null; if (el?.closest('.hdm-likes')) return; openHdmDetailInProfile(p); // ⟵ Detail-Overlay im Profil öffnen }); // Zahl erzwingen & Herz einfärben (HDM-Helfer, mit Fallbacks aus A) const likeBtn = card.querySelector('.hdm-likes'); window.forceLikeNumber?.(likeBtn, p); window.setHeartVisualBox?.(likeBtn, !!p.liked); // Like-Toggle (optimistisch), nutzt rpcToggleLike wenn vorhanden likeBtn.addEventListener('click', async (e)=>{ e.stopPropagation(); if (!id) return; // nur HDM-Einträge liken if (window.isLikePending?.(id)) return; window.setLikePending?.(id, true); const wasLiked = likeBtn.classList.contains('liked'); const numEl = likeBtn.querySelector('.hdm-like-num'); const prev = Math.max(0, parseInt(numEl?.textContent||'0',10)); // Optimistisch const optimisticLiked = !wasLiked; const optimisticCount = optimisticLiked ? prev+1 : Math.max(0, prev-1); likeBtn.classList.toggle('liked', optimisticLiked); if(numEl) numEl.textContent = String(optimisticCount); try{ if (window.rpcToggleLike){ const res = await window.rpcToggleLike(id); window.applyLikeResultToCard?.(likeBtn, res); } }catch(err){ // Revert bei Fehler likeBtn.classList.toggle('liked', wasLiked); if(numEl) numEl.textContent = String(prev); }finally{ window.setLikePending?.(id, false); } }); hdmGrid.appendChild(card); }); } } /* Profil-Galerie laden (Supabase Storage 'profile-gallery' per User-Prefix) */ /* Profil-Galerie laden (Supabase Storage 'profile-gallery' per User-Prefix) */ async function loadGalleryFor(profileUid){ const sb = await getSB(); const grid = ui.galleryGrid; if (!grid) return 0; grid.innerHTML = ''; // keine Plus-Kachel mehr // 1) Cache sofort rendern (wenn vorhanden) const cached = getCachedGallery(profileUid); if (Array.isArray(cached) && cached.length){ cached.forEach(item=>{ const cell = document.createElement('div'); cell.className='dm2-gallery-item'; cell.dataset.uid = item.uid; cell.dataset.name = item.name; const img = document.createElement('img'); img.src=item.url; img.alt='Foto'; wireImgFallback(img); cell.appendChild(img); cell.addEventListener('click', ()=> openProfilePhotoDetail(item)); grid.appendChild(cell); }); } // 2) Frisch laden (und Cache ersetzen) if(!sb || !profileUid) return cached?.length || 0; let files = []; try{ const { data:list } = await sb.storage .from('profile-gallery') .list(${profileUid}, { limit: 200, offset:0, sortBy:{ column:'name', order:'desc' } }); files = Array.isArray(list) ? list : []; }catch(e){ console.warn('[gallery list]', e); } const urls = files.map(f=>{ const { data } = sb.storage.from('profile-gallery').getPublicUrl(${profileUid}/${f.name}); return { uid: String(profileUid), name: String(f.name), url: data?.publicUrl || '', ts: f.name.match(/(\d{13})/)? Number(RegExp.$1) : 0 }; }).filter(x=>x.url); // Neueste zuerst (Timestamp im Dateinamen), sonst Name urls.sort((a,b)=> (b.ts - a.ts) || (a.name < b.name ? 1 : -1)); // UI ersetzen (frisches Ergebnis rendert „über“ dem evtl. veralteten Cache) grid.innerHTML = ''; urls.forEach(item=>{ const cell = document.createElement('div'); cell.className='dm2-gallery-item'; cell.dataset.uid = item.uid; cell.dataset.name = item.name; const img = document.createElement('img'); img.src=item.url; img.alt='Foto'; wireImgFallback(img); cell.appendChild(img); cell.addEventListener('click', ()=> openProfilePhotoDetail(item)); grid.appendChild(cell); }); // Cache setzen setCachedGallery(profileUid, urls); return urls.length; } /* --- Modal-Logik --- */ let scrollMem=0; let pgScrollMem = 0; function openSheet(){ scrollMem=window.scrollY||0; document.body.classList.add('dm2-lock'); document.body.style.top=-${scrollMem}px; $('#dm2Modal').classList.add('open'); } function closeSheet(){ $('#dm2Modal').classList.remove('open'); document.body.classList.remove('dm2-lock'); document.body.style.top=''; window.scrollTo(0,scrollMem); } $('#dm2EditBtn')?.addEventListener('click', openSheet); $('#dm2Modal')?.addEventListener('click',(e)=>{ if(e.target===e.currentTarget) closeSheet(); }); document.addEventListener('keydown',(e)=>{ if(e.key==='Escape' && $('#dm2Modal')?.classList?.contains('open')) closeSheet(); }); $('#dm2Cancel')?.addEventListener('click', closeSheet); /* --- Follower-Listen (unverändert) --- */ $('#openFollowers')?.addEventListener('click',()=>{}); // Handler wird unten gesetzt $('#openFollowing')?.addEventListener('click',()=>{}); (async ()=>{ // NEU: Memberstack + Supabase parallel holen -> schneller const [ms, sb] = await Promise.all([getMS(), getSB()]); console.log('[DM] MS/SB ready?', { ms: !!ms, sb: !!(sb && sb.from) }); let myId=null,myCF={}; if(ms){ const me=await getMemberNormalized(ms); myId=me.id; myCF=me.cf||{}; } // global merken (für Session-Stash beim Post-Klick) window._DM_MY_ID = myId || null; const profileUid = myId; // eigenes Profil hydrate(myCF, true); await loadPostsFor(profileUid); // --- Profil-Galerie Upload --- function extFromType(blob){ return blob?.type === 'image/webp' ? '.webp' : (blob?.type === 'image/png' ? '.png' : '.jpg'); } // FAB öffnet den Dateiauswahl-Dialog $('#dm2FabAdd')?.addEventListener('click', ()=> ui.galleryFile?.click()); ui.galleryFile?.addEventListener('change', async (e)=>{ const f = e.target.files?.[0]; if(!f) return; const me = await getMemberNormalized(ms); const myId = me.id; if(!myId){ alert('Bitte einloggen.'); return; } const compressed = await window.compressImage(f, { maxW:1600, maxH:1600, targetBytes:600*1024, mimePreferred:'image/webp' }); const uploadFile = compressed || f; const safe = s=>s.replace(/[^a-zA-Z0-9._-]/g,'_'); const base = g_${Date.now()}_${safe(f.name)}.replace(/\.(heic|heif|png|jpe?g|webp|avif)$/i,''); const path = ${myId}/${base}${extFromType(uploadFile)}; const up = await sb.storage.from('profile-gallery').upload(path, uploadFile, { upsert:true, cacheControl:'3600' }); if(up?.error){ alert('Upload fehlgeschlagen: '+up.error.message); return; } const pub = sb.storage.from('profile-gallery').getPublicUrl(path); const newUrl = pub?.data?.publicUrl || ''; // Cache refreshen & UI updaten clearCachedGallery(myId); await loadGalleryFor(myId); e.target.value=''; // Sofort ins Detail springen (wie HDM) if(newUrl){ openProfilePhotoDetail({ uid: String(myId), name: path.split('/').pop(), url: newUrl }); } }); // Public Profile + Media-Tabellen synchron halten async function dm_syncPublicProfile(sb, myId, cf){ try{ if(!sb||!myId) return; const row={memberstack_id:myId,hundename:cf?.hundename||cf?.name||null,geschlecht:cf?.geschlecht||null,geburtstag:cf?.geburtstag||null,rasse:cf?.rasse||null,bio:cf?.bio||null,updated_at:new Date().toISOString()}; await sb.from('doggo_public_profile').upsert(row,{onConflict:'memberstack_id'});}catch(e){console.warn('[syncPublicProfile]',e);} } async function upsertMedia(sb,myId,{avatar_url=null,cover_url=null}={}){ try{ if(!sb||!myId) return; const row={memberstack_id:myId}; if(avatar_url) row.avatar_url=avatar_url; if(cover_url) row.cover_url=cover_url; await sb.from('doggo_profile_media').upsert(row,{onConflict:'memberstack_id'});}catch(e){console.warn('[upsertMedia]',e);} } if(sb && myId){ await dm_syncPublicProfile(sb, myId, Object.assign({hundename:myCF.hundename||ui.name.textContent, rasse:myCF.rasse||$('#ab2Breed').textContent}, myCF)); const bg = getComputedStyle($('#dm2Cover')).backgroundImage || ''; const coverUrl = bg.startsWith('url(') ? bg.slice(4,-1).replace(/^"|"$|^'|'$/g,'') : ''; await upsertMedia(sb, myId, { avatar_url: myCF.profilbild || $('#dm2Avatar').src || null, cover_url: myCF.profilcover || coverUrl || null }); } $('#dm2Share')?.addEventListener('click', async ()=>{ const shareUrl=${location.origin}/user?uid=${encodeURIComponent(profileUid)}; if(navigator.share){ try{ await navigator.share({title:$('#dm2Name').textContent||'DoggoMeal', text:'Schau dir dieses Profil auf DoggoMeal an 🐾', url:shareUrl}); }catch(_){} }else{ try{ await navigator.clipboard.writeText(Schau dir dieses Profil auf DoggoMeal an 🐾\n${shareUrl}); alert('Link kopiert!'); }catch(_){ alert(shareUrl); } } }); async function refreshFollow(){ const sb2=await getSB(); if(!sb2||!profileUid) return; const { data:a }=await sb2.from('doggo_follows').select('follower_id,followee_id'); const followers=(a||[]).filter(x=>String(x.followee_id)===String(profileUid)).map(x=>x.follower_id); const following=(a||[]).filter(x=>String(x.follower_id)===String(profileUid)).map(x=>x.followee_id); $('#dm2Followers').textContent=followers.length; $('#dm2Following').textContent=following.length; async function fill(ids, listEl){ listEl.innerHTML=''; if(!ids.length){ listEl.innerHTML='<div style="opacity:.6;padding:10px 12px">Noch leer</div>'; return; } const { data:profiles } = await sb2.from('doggo_public_profile').select('*').in('memberstack_id', ids); const { data:media } = await sb2.from('doggo_profile_media').select('*').in('memberstack_id', ids); const mapP=new Map((profiles||[]).map(r=>[String(r.memberstack_id),r])); const mapM=new Map((media||[]).map(r=>[String(r.memberstack_id),r])); ids.forEach(uid=>{ const p=mapP.get(String(uid))||{}; const m=mapM.get(String(uid))||{}; const displayName = p.hundename || 'Doggo'; const row=document.createElement('div'); row.className='dm2-user-row'; row.innerHTML = <img src="${m.avatar_url||'https://via.placeholder.com/80?text=D'}" alt=""> <div class="dm2-user-text"> <div class="dm2-user-name">${displayName}</div> <div class="dm2-user-handle">@${(displayName||'doggo').toLowerCase().replace(/\s+/g,'_')}</div> </div> ; row.addEventListener('click', (e)=>{ const el = (e.target instanceof Element) ? e.target : null; if (el?.closest('.dm2-mini-follow')) return; if(String(uid)===String(myId)){ closeFollowModal(); return; } location.href=/user?uid=${encodeURIComponent(uid)}; }); listEl.appendChild(row); }); } $('#openFollowers').onclick = ()=>{ fill(followers, $('#listFollowers')); openFollowModal('followers'); }; $('#openFollowing').onclick = ()=>{ fill(following, $('#listFollowing')); openFollowModal('following'); }; } refreshFollow(); /* Avatar upload */ $('#dm2File')?.addEventListener('change', async ()=>{ const f=$('#dm2File').files?.[0]; if(!f){return;} const sb=await getSB(); const ms=await getMS(); const me=await getMemberNormalized(ms); const myId=me.id; if(!sb||!myId) return; const safe = s=>s.replace(/[^a-zA-Z0-9._-]/g,'_'); const processed = await compressImage(f, { maxW:1440, maxH:1440, targetBytes:300*1024, mimePreferred:'image/webp' }); const fileToUp = processed || f; const path = ${myId}/avatar_${Date.now()}_${safe(fileToUp.name || 'avatar.jpg')}; const up = await sb.storage.from('avatars').upload(path, fileToUp, { upsert:true, cacheControl:'3600' }); if(up?.error){ alert('Upload fehlgeschlagen: '+up.error.message); return; } const { data:pub }=sb.storage.from('avatars').getPublicUrl(path); const url=pub?.publicUrl; if(url){ $('#dm2Avatar').src=url; try{ await ms.updateMember({ customFields:{ profilbild:url } }); }catch(_){} try{ await sb.from('doggo_profile_media').upsert({ memberstack_id: myId, avatar_url: url }, { onConflict: 'memberstack_id' }); }catch(_){} try{ await sb.from('doggo_public_profile').upsert({ memberstack_id: myId, hundename: $('#dm2Name').textContent }, { onConflict: 'memberstack_id' }); }catch(_){} alert('Profilbild aktualisiert ✅'); } $('#dm2File').value=''; }); /* Cover upload */ $('#dm2Cover')?.addEventListener('click', ()=> $('#dm2FileCover')?.click()); $('#dm2FileCover')?.addEventListener('change', async ()=>{ const f=$('#dm2FileCover').files?.[0]; if(!f){return;} const sb=await getSB(); const ms=await getMS(); const me=await getMemberNormalized(ms); const myId=me.id; if(!sb||!myId){return;} const safe=s=>s.replace(/[^a-zA-Z0-9._-]/g,'_'); const processed = await compressImage(f, { maxW:1600, maxH:1600, targetBytes:300*1024, mimePreferred:'image/webp' }); const fileToUp = processed || f; const path = ${myId}/cover_${Date.now()}_${safe(fileToUp.name || 'cover.jpg')}; const up = await sb.storage.from('profile-banners').upload(path, fileToUp, { upsert:true, cacheControl:'3600' }); if(up?.error){ alert('Upload fehlgeschlagen: '+up.error.message); return; } const { data:pub }=sb.storage.from('profile-banners').getPublicUrl(path); const url=pub?.publicUrl; if(url){ $('#dm2Cover').style.backgroundImage=url("${url}"); try{ await ms.updateMember({ customFields:{ profilcover:url } }); }catch(_){} try{ await sb.from('doggo_profile_media').upsert({ memberstack_id: myId, cover_url: url }, { onConflict: 'memberstack_id' }); }catch(_){} alert('Banner aktualisiert ✅'); } $('#dm2FileCover').value=''; }); /* Edit-Sheet speichern */ const MAX_BIO=70; function updateBioCounter(){ const el = $('#in2Bio'); if(!el) return; let v = el.value || ''; if(v.length > MAX_BIO){ v = v.slice(0, MAX_BIO); el.value = v; } $('#bioCount') && (ui.bioCount.textContent = ${v.length}/${MAX_BIO}); } $('#in2Bio')?.addEventListener('input', updateBioCounter); updateBioCounter(); $('#dm2Save')?.addEventListener('click', async ()=>{ const ms=await getMS(); const sb=await getSB(); if(!ms) return alert('Memberstack noch nicht bereit.'); const updates={ bio: $('#in2Bio').value.slice(0,MAX_BIO), gewicht: $('#in2Weight').value, kastriert: $('#in2Neutered').value, geburtstag: $('#in2Birth').value, endgewicht: $('#in2Goal').value, allergien: selectedTags }; try{ await ms.updateMember({ customFields: updates }); const bg = getComputedStyle($('#dm2Cover')).backgroundImage || ''; const coverUrl = bg.startsWith('url(') ? bg.slice(4,-1).replace(/^"|"$|^'|'$/g,'') : ''; const merged=Object.assign({}, updates, { hundename:$('#dm2Name').textContent, rasse:$('#ab2Breed').textContent, profilbild:$('#dm2Avatar').src, profilcover: coverUrl }); hydrate(merged, true); const me=await getMemberNormalized(ms); try{ await sb.from('doggo_public_profile').upsert({ memberstack_id: me.id, hundename: $('#dm2Name').textContent, bio: merged.bio, rasse: merged.rasse, geburtstag: merged.geburtstag }, { onConflict: 'memberstack_id' }); }catch(_){} try{ await sb.from('doggo_profile_media').upsert({ memberstack_id: me.id, avatar_url: $('#dm2Avatar').src, cover_url: coverUrl }, { onConflict: 'memberstack_id' }); }catch(_){} // NEU: Galerie-Cache leeren, damit Captions/Bilder neu kommen clearCachedGallery(me.id); $('#dm2Cancel').click(); alert('Änderungen gespeichert ✅'); }catch(e){ console.error(e); alert('Speichern fehlgeschlagen.'); } }); /* Bottom-Nav z-index + sichere Klick-Navigation (wie gehabt) */ (function boostBottomNav(){ const nav=document.querySelector('.bottom-nav, .bottom_nav, [data-bottom-nav]'); if(!nav) return; nav.style.zIndex='2147483000'; // Overlay (2147483647) bleibt darüber nav.style.pointerEvents='auto'; nav.querySelectorAll('a[href]').forEach(a=>{ a.addEventListener('click',(e)=>{ e.preventDefault(); e.stopPropagation(); const href=a.getAttribute('href'); if(href) window.location.href = href; }); }); })(); /* === GLOBAL: Bottom-Nav-Clicks erzwingen, auch wenn Overlays offen sind === */ (function forceBottomNavClicks(){ function cleanup(){ try{ // Alle Overlays zu, Lock zurücksetzen window.DGM_HDM?.closeAll?.(); try{ closeProfilePhotoDetail(); }catch(_){} if (typeof dmCleanupLocks === 'function') dmCleanupLocks(); document.body.classList.remove('dm2-lock'); document.body.style.top = ''; }catch(_){} } document.addEventListener('click', (e)=>{ const a = (e.target instanceof Element) ? e.target.closest('.bottom-nav a[href], .bottom_nav a[href], [data-bottom-nav] a[href]') : null; if(!a) return; e.preventDefault(); e.stopPropagation(); const href = a.getAttribute('href'); cleanup(); if(href) window.location.href = href; }, true); // capture })(); /* Follow-Modal helpers */ function openFollowModal(which){ $('#fTitle').textContent = which==='following' ? 'Folgt' : 'Follower'; $('#listFollowers').style.display = which==='followers' ? 'block' : 'none'; $('#listFollowing').style.display = which==='following' ? 'block' : 'none'; $('#dm2FollowModal').classList.add('open'); document.body.classList.add('dm2-lock'); } function closeFollowModal(){ $('#dm2FollowModal').classList.remove('open'); document.body.classList.remove('dm2-lock'); } $('#closeFollowModal')?.addEventListener('click', closeFollowModal); $('#dm2FollowModal')?.addEventListener('click',(e)=>{ if(e.target===e.currentTarget) closeFollowModal(); }); function _navLower(z='1'){ const nav=document.querySelector('.bottom-nav, .bottom_nav, [data-bottom-nav]'); if(!nav) return; if(!nav.dataset.prevZ) nav.dataset.prevZ = nav.style.zIndex || ''; nav.style.zIndex = z; } function _navRestore(){ const nav=document.querySelector('.bottom-nav, .bottom_nav, [data-bottom-nav]'); if(!nav) return; const prev = nav.dataset.prevZ ?? ''; nav.style.zIndex = prev; delete nav.dataset.prevZ; } /* NEU: HDM-Karte im Profil direkt im Profil-Overlay öffnen */ function openHdmDetailInProfile(p){ const item = { type: 'hdm', id: p.id, uid: p.memberstack_id || p.member_id || p.owner_id || p.uid || null, name: String(p.id), url: p.bild_url, likes: Number(p.likes||0), liked: !!p.liked, hundename: p.hundename || 'Doggo' }; // (optional) Namen im Overlay-Header setzen const un = document.getElementById('pg-profile-username'); if (un) un.textContent = item.hundename; // vorhandenes Profil-Overlay öffnen (du hast openProfilePhotoDetail schon) openProfilePhotoDetail(item); } // === Profil-Galerie Detail (HDM-Optik) === async function openProfilePhotoDetail(item){ const ov = document.getElementById('pg-detail'); if(!ov) return; const img = document.getElementById('pg-detail-img'); const sk = document.getElementById('pg-detail-skeleton'); const menu= document.getElementById('pg-detail-menu'); // Header füllen (Name/Avatar aus Profil) const displayName = document.getElementById('dm2Name')?.textContent || 'Doggo'; const avatarUrl = document.getElementById('dm2Avatar')?.src || 'https://i.imgur.com/ZcLLrkY.png'; document.getElementById('pg-profile-username').textContent = displayName; const pimg = document.getElementById('pg-profile-img'); pimg.src = avatarUrl; wireImgFallback(pimg); // Bild laden sk.style.display = 'flex'; img.src = item.url || ''; wireImgFallback(img); img.onload = ()=> sk.style.display = 'none'; img.onerror= ()=> sk.style.display = 'none'; // Overlay öffnen (+ Scroll-Pos merken & Body fixieren) pgScrollMem = window.scrollY || 0; ov.style.display='flex'; ov.classList.add('open'); document.body.classList.add('dm2-lock'); document.body.style.top = -${pgScrollMem}px; _navLower('1'); // Nav hinter das Overlay parken // Edge-Swipe nur einmal anhängen if(!ov.dataset.swipe){ attachEdgeSwipePG(ov, closeProfilePhotoDetail, '.hdm-detail-scroll'); ov.dataset.swipe = '1'; } // Menü (eigene Fotos: Bearbeiten/Löschen; fremde: Melden) menu.innerHTML = ''; const myId = window._DM_MY_ID || null; const isOwner = String(item.uid||'') === String(myId||''); const menuBtn = document.getElementById('pg-detail-menu-btn'); menuBtn.onclick = (e)=>{ e.stopPropagation(); menu.style.display = (menu.style.display==='block')?'none':'block'; }; if (window._pgMenuOutsideHandler) document.removeEventListener('click', window._pgMenuOutsideHandler); window._pgMenuOutsideHandler = (e)=>{ if(!menu.contains(e.target) && e.target!==menuBtn) menu.style.display='none'; }; document.addEventListener('click', window._pgMenuOutsideHandler); if (isOwner){ const editBtn = document.createElement('button'); editBtn.textContent = 'Beschreibung bearbeiten'; editBtn.onclick = ()=>{ menu.style.display='none'; pg_editCaption(item); }; const delBtn = document.createElement('button'); delBtn.textContent = 'Foto löschen'; delBtn.onclick = async ()=>{ menu.style.display='none'; if(delBtn.disabled) return; if(!confirm('Foto wirklich löschen?')) return; delBtn.disabled = true; try{ const sb = await getSB(); await sb.storage.from('profile-gallery').remove([ ${item.uid}/${item.name} ]); // Cache leeren, damit das Grid sofort stimmt try{ clearCachedGallery(item.uid); }catch(_){} closeProfilePhotoDetail(); await loadGalleryFor(item.uid); }catch(e){ alert('Löschen fehlgeschlagen.'); }finally{ delBtn.disabled = false; } }; menu.append(editBtn, delBtn); }else{ const reportBtn = document.createElement('button'); reportBtn.textContent = 'Beitrag melden'; reportBtn.onclick = ()=>{ menu.style.display='none'; guardedReport('profile_gallery', ${item.uid}/${item.name}, reportBtn); }; menu.append(reportBtn); } // Caption laden/anzeigen await pg_renderCaption(item); // Profilklick -> /user?uid=... (nur wenn NICHT eigener Beitrag) document.getElementById('pg-profile-link').onclick = ()=>{ const myId = window._DM_MY_ID || null; closeProfilePhotoDetail(); if (String(item.uid||'') === String(myId||'')) return; // eigener Beitrag: im eigenen Profil bleiben setTimeout(()=>{ location.href = /user?uid=${encodeURIComponent(item.uid)}; }, 10); }; // Like-Button setzen (nutzt das globale Modul) const likeBox = document.getElementById('pg-detail-likebox'); if (likeBox){ likeBox.innerHTML = ''; if (item.type === 'hdm'){ // HDM-Post (id muss existieren) window.DGMlikes?.renderButton(likeBox, { type: 'hdm', id: item.id, initial: { likes: item.likes||0, liked: !!item.liked } }); }else{ // Profil-Galerie (generischer Typ, key = uid/filename) const ref = ${item.uid}/${item.name}; window.DGMlikes?.renderButton(likeBox, { type: 'profile_gallery', id: ref }); } } // Close document.getElementById('pg-detail-close').onclick = ()=> closeProfilePhotoDetail(); // Kommentare mounten (HDM ↔︎ Profil-Galerie korrekt unterscheiden) const commentsBox = document.getElementById('pg-detail-comments'); commentsBox.innerHTML = ''; const mount = document.createElement('div'); mount.className = "dgm-comments-box"; const cType = (item.type === 'hdm') ? 'hdm' : 'profile_gallery'; const cRef = (item.type === 'hdm') ? String(item.id) : ${item.uid}/${item.name}; mount.dataset.commentsType = cType; mount.dataset.commentsRefId = cRef; commentsBox.appendChild(mount); window.DGMcomments?.init(mount, { type: cType, refId: cRef }); } function closeProfilePhotoDetail(){ const ov = document.getElementById('pg-detail'); if(!ov) return; ov.classList.remove('open'); ov.style.display = 'none'; document.body.classList.remove('dm2-lock'); document.body.style.top = ''; window.scrollTo(0, pgScrollMem||0); const img = document.getElementById('pg-detail-img'); if (img) img.src = ''; const sk = document.getElementById('pg-detail-skeleton'); if (sk) sk.style.display = 'none'; _navRestore(); // ursprünglichen Z-Index der Nav zurückholen } // Caption helpers (optional: speichert in Tabelle 'profile_gallery_meta', falls vorhanden) async function pg_loadCaption(item){ try{ const sb = await getSB(); const { data } = await sb.from('profile_gallery_meta') .select('caption').eq('memberstack_id', item.uid).eq('file_name', item.name).maybeSingle(); return data?.caption || ''; }catch{ return ''; } } async function pg_saveCaption(item, text){ try{ const sb = await getSB(); await sb.from('profile_gallery_meta') .upsert({ memberstack_id:item.uid, file_name:item.name, caption:text }, { onConflict:'memberstack_id,file_name' }); }catch(_){} } async function pg_renderCaption(item){ const row = document.getElementById('pg-detail-caption-row'); row.innerHTML=''; const hundename = document.getElementById('pg-profile-username')?.textContent || 'Doggo'; const wrap = document.createElement('span'); wrap.className='hdm-caption-wrap'; const text = document.createElement('span'); text.className='hdm-caption-text'; text.textContent = await pg_loadCaption(item); const username = document.createElement('span'); username.className='hdm-caption-username'; username.textContent = hundename; row.append(username, wrap); wrap.appendChild(text); if(text.textContent.trim()){ text.classList.add('caption-truncate'); requestAnimationFrame(()=>{ const clamped = text.scrollHeight > text.clientHeight + 1; if(!clamped) text.classList.remove('caption-truncate'); else{ const t=document.createElement('button'); t.className='caption-more-btn'; t.textContent='mehr'; let expanded=false; t.onclick=()=>{ expanded=!expanded; text.classList.toggle('caption-truncate', !expanded); t.textContent=expanded?'weniger':'mehr'; }; wrap.appendChild(t); } }); } } function pg_editCaption(item){ const row = document.getElementById('pg-detail-caption-row'); const old = row.textContent?.trim() ? row.querySelector('.hdm-caption-text')?.textContent || '' : ''; row.innerHTML = <textarea id="pg-caption-input" rows="2" placeholder="Beschreibe das Bild...">${old||''}</textarea> <button class="caption-save-btn" id="pg-caption-save">Speichern</button>; document.getElementById('pg-caption-save').onclick = async ()=>{ const val = (document.getElementById('pg-caption-input').value||'').trim(); await pg_saveCaption(item, val); await pg_renderCaption(item); }; } /* Edge-Swipe (wie HDM, leicht vereinfacht) */ function attachEdgeSwipePG(overlayEl, onDismiss, scrollSelector){ if (!overlayEl) return; const panel = overlayEl.querySelector(scrollSelector) || overlayEl; panel.style.willChange = 'transform'; let tracking=false, startX=0, startY=0, moved=false; overlayEl.addEventListener('pointerdown', (e)=>{ if (e.clientX > 24) return; // nur Rand links tracking=true; moved=false; startX=e.clientX; startY=e.clientY; panel.style.transition='none'; overlayEl.setPointerCapture?.(e.pointerId); }); overlayEl.addEventListener('pointermove', (e)=>{ if(!tracking) return; const dx = e.clientX - startX, dy = Math.abs(e.clientY - startY); if (dy > 12 && Math.abs(dx) < 8) return; // vert. Scroll tolerieren if (dx < 0){ panel.style.transform=translateX(${dx*0.2}px); moved=true; return; } e.preventDefault(); moved=true; panel.style.transform = translateX(${dx}px); }, {passive:false}); function end(e){ if(!tracking) return; tracking=false; overlayEl.releasePointerCapture?.(e.pointerId); panel.style.transition='transform .22s ease'; const dx = e.clientX - startX; if (moved && dx > 70){ panel.style.transform='translateX(100%)'; setTimeout(()=>{ panel.style.transform=''; onDismiss(); }, 180); } else { panel.style.transform=''; } } overlayEl.addEventListener('pointerup', end); overlayEl.addEventListener('pointercancel', end); } // --- PUBLIC API: für andere Listener/Inline-Handler verfügbar machen window.openProfilePhotoDetail = openProfilePhotoDetail; window.closeProfilePhotoDetail = closeProfilePhotoDetail; window.openHdmDetailInProfile = openHdmDetailInProfile; // NEU: bfcache/pageshow-Reset -> verhindert „zweiten Klick nötig“ nach Zurück vom HDM-Detail function dmCleanupLocks(){ document.body.classList.remove('dm2-lock'); document.body.style.top=''; $('#dm2Modal')?.classList.remove('open'); $('#dm2Photo')?.classList.remove('open'); $('#dm2FollowModal')?.classList.remove('open'); $('#pg-detail')?.classList.remove('open'); } window.addEventListener('pagehide', dmCleanupLocks); window.addEventListener('beforeunload', dmCleanupLocks); window.addEventListener('popstate', dmCleanupLocks); window.addEventListener('hashchange', dmCleanupLocks); document.addEventListener('click', (e)=>{ const a = (e.target instanceof Element) ? e.target.closest('a[href]') : null; if(!a) return; const href = a.getAttribute('href') || ''; if (a.hasAttribute('download')) return; if (/^https?:\/\//i.test(href) && !href.startsWith(location.origin)) return; try { dmCleanupLocks(); }catch(_){} }, true); window.addEventListener('pageshow', ()=>{ dmCleanupLocks(); }); document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) dmCleanupLocks(); }); // ——— A) Globale HDM-Helpers für Likes ——— window._likePending = window._likePending || new Set(); window.setLikePending = window.setLikePending || ((id,on)=>{ if(on) window._likePending.add(String(id)); else window._likePending.delete(String(id)); }); window.isLikePending = window.isLikePending || (id => window._likePending.has(String(id))); window.getLikes = window.getLikes || (p => Math.max(0, Number(p?.likes || 0))); window.forceLikeNumber = window.forceLikeNumber || ((btn,p)=>{ const n = btn?.querySelector?.('.hdm-like-num'); if(n) n.textContent = String(window.getLikes(p)); }); window.setHeartVisualBox = window.setHeartVisualBox || ((btn,on)=>{ btn?.classList?.toggle('liked', !!on); }); window.applyLikeResultToCard = window.applyLikeResultToCard || ((btn,res)=>{ if(!btn||!res) return; const n = btn.querySelector('.hdm-like-num'); const liked = !!res.liked_now; const cnt = Math.max(0, Number(res.likes||0)); btn.classList.toggle('liked', liked); if(n) n.textContent = String(cnt); }); /* Fallback: Likes in hund_des_monats_likes toggeln, wenn kein rpcToggleLike vorhanden ist */ if (!window.rpcToggleLike) { window.rpcToggleLike = async function(postId){ try{ const sb = await getSB(); const ms = await getMS(); const me = ms ? await getMemberNormalized(ms) : { id:null }; const uid = me?.id; if (!sb || !uid || !postId) return { liked_now:false, likes:0 }; // Gibt es bereits einen Like? const { data: ex } = await sb .from('hund_des_monats_likes') .select('id') .eq('bild_id', postId) .eq('memberstack_id', uid) .maybeSingle(); if (ex) { await sb.from('hund_des_monats_likes').delete().eq('id', ex.id); } else { await sb.from('hund_des_monats_likes').insert({ bild_id: postId, memberstack_id: uid }); } // Frischen Count holen const { count } = await sb .from('hund_des_monats_likes') .select('*', { count:'exact', head:true }) .eq('bild_id', postId); return { liked_now: !ex, likes: count || 0 }; }catch(_){ return { liked_now:false, likes:0 }; } }; } })(); } catch(e) { console.error('[DM FATAL]', e); } })(); </script> <style> :root{ --dm-bg:#ffe6c7; --dm-panel:#fff9f1; --dm-ink:#3a2d1a; --dm-muted:#8a6f57; --dm-brand:#cc7255; --dm-br:#ead8bd; --dm-shadow:0 12px 28px rgba(0,0,0,.08); } /* NEU: iOS Tap-Highlight aus (verhindert „weißen Kreis“ beim Tippen) */ .dm2-wrap * { -webkit-tap-highlight-color: transparent; } #hundeprofil-section{background:var(--dm-bg);} #hundeprofil-section .dm2-wrap{ max-width:720px;margin:0 auto;padding:16px 12px 24px;color:var(--dm-ink);font-family:'Merriweather',serif;background:var(--dm-bg); } .dm2-head{position:relative;background:var(--dm-panel);border:2px solid var(--dm-br);border-radius:22px;overflow:hidden;box-shadow:var(--dm-shadow);} .dm2-cover{height:168px;background:#ffd9b5 center/cover no-repeat;cursor:pointer} .dm2-gear,.dm2-share{ position:absolute;top:12px;width:42px;height:42px;border-radius:12px;border:2px solid var(--dm-br);background:var(--dm-panel);cursor:pointer;z-index:3 } .dm2-gear{right:12px} .dm2-share{right:60px} .dm2-gear::before{content:"⚙️";display:block;text-align:center;line-height:38px} .dm2-share::before{content:"🔗";display:block;text-align:center;line-height:38px} .dm2-menu{ position:absolute;right:12px;top:60px;min-width:260px;background:var(--dm-panel);border:2px solid var(--dm-br);border-radius:14px;box-shadow:var(--dm-shadow);padding:6px;display:none;z-index:4 } .dm2-menu.open{display:block} .dm2-menu h4{margin:6px 8px 4px;font-size:12px;color:var(--dm-muted);text-transform:uppercase;letter-spacing:.06em} .dm2-menu button{width:100%;background:transparent;border:0;text-align:left;padding:10px 12px;border-radius:10px;cursor:pointer;font-weight:800} .dm2-menu button:hover{background:#fff1e2} .dm2-row{ display:grid;grid-template-columns:150px 1fr;gap:14px;align-items:start;padding:0 16px 14px } .dm2-left{display:flex;flex-direction:column;align-items:flex-start;gap:10px;margin-top:-62px} .dm2-avatar{ width:118px;height:118px;border-radius:50%;border:6px solid var(--dm-panel);overflow:hidden;box-shadow:0 10px 22px rgba(0,0,0,.12);background:#fff;cursor:pointer } .dm2-avatar img{width:100%;height:100%;object-fit:cover;display:block;touch-action:manipulation} .dm2-badges-left{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-start} .dm2-badge{background:#ffe6c7;border:1.5px solid var(--dm-br);padding:6px 10px;border-radius:999px;font-size:13px} .dm2-right{min-width:0;padding-top:18px} .dm2-toprow{display:flex;align-items:center;gap:10px;flex-wrap:wrap} .dm2-name{font-size:26px;line-height:1.1;margin:0 0 2px;font-weight:900} .dm2-handle{font-size:14px;color:var(--dm-muted);margin-bottom:6px} .dm2-bio{ white-space:pre-wrap;font-size:14px;line-height:1.35;margin:6px 0 0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden } .dm2-stats{ display:flex;justify-content:space-around;text-align:center;padding:10px 10px 14px;border-top:2px dashed var(--dm-br);background:var(--dm-panel) } .dm2-stat b{font-size:18px;display:block} .dm2-stat span{font-size:12px;color:var(--dm-muted)} .dm2-stat a{display:block;text-decoration:none;color:inherit;cursor:pointer} .dm2-follow{align-self:flex-start;margin-left:0;background:var(--dm-brand);color:#fff;border:2px solid var(--dm-brand);border-radius:12px;padding:8px 12px;font-weight:900;cursor:pointer} .dm2-follow.is-following{background:#fff;border-color:var(--dm-brand);color:#var(--dm-brand)} .dm2-tabs{ display:flex;gap:10px;padding:14px 6px 0;position:sticky;top:0;z-index:2;background:linear-gradient(180deg,rgba(255,230,199,.94),rgba(255,230,199,.78)) } .dm2-tab{flex:1;text-align:center;padding:10px 12px;border-radius:14px;border:2px solid var(--dm-br);background:var(--dm-panel);cursor:pointer;font-weight:900} .dm2-tab.active{background:var(--dm-brand);color:#fff;border-color:var(--dm-brand)} .dm2-panels{padding:12px 2px} .dm2-panel{display:none} .dm2-panel.active{display:block} .dm2-grid{display:grid;gap:14px;grid-template-columns:repeat(2,minmax(0,1fr))} @media (max-width:420px){ .dm2-grid{grid-template-columns:1fr} } .dm2-card{background:#fffdf8;border:1.5px solid var(--dm-br);border-radius:18px;overflow:hidden;box-shadow:0 6px 16px rgba(0,0,0,.06)} .dm2-card img{width:100%;height:100%;display:block;object-fit:cover;aspect-ratio:1/1} .dm2-about{background:var(--dm-panel);border:2px solid var(--dm-br);border-radius:18px;padding:14px} .dm2-about dl{display:grid;grid-template-columns:140px 1fr;gap:8px 12px;margin:0} .dm2-about dt{color:var(--dm-muted)} .dm2-about dd{margin:0;font-weight:700} .dm2-private{display:block} .dm2-private.hidden{display:none !important} .dm2-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:9000;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)} .dm2-modal.open{display:flex;align-items:flex-end;justify-content:center} .dm2-sheet{ width:100%;max-width:720px;background:var(--dm-panel);border-top:6px solid var(--dm-brand);border-radius:22px 22px 0 0;box-shadow:0 -12px 30px rgba(0,0,0,.2);padding:16px 22px calc(100px + env(safe-area-inset-bottom));max-height:88vh;overflow:auto; } .dm2-grid2{display:flex;flex-direction:column;gap:12px;padding-right:10px} .dm2-field label{font-weight:900;font-size:14px;display:block;margin-bottom:6px} .dm2-inp,.dm2-sel,.dm2-date,.dm2-text{width:100%;padding:10px 12px;border:2px solid var(--dm-br);border-radius:12px;background:#fffdf8;font-family:inherit;box-sizing:border-box} .dm2-date{padding-right:20px} .dm2-text{min-height:84px;resize:vertical} .dm2-count{font-size:12px;color:var(--dm-muted);text-align:right;margin-top:4px} .dm2-actions-row{display:flex;gap:10px;justify-content:flex-end;margin-top:14px} .dm2-btn{border:2px solid var(--dm-br);background:var(--dm-panel);padding:10px 14px;border-radius:12px;font-weight:800;cursor:pointer} .dm2-btn.brand{background:var(--dm-brand);border-color:var(--dm-brand);color:#fff} .dm2-tags{display:flex;flex-wrap:wrap;gap:8px} .dm2-tag{background:#e0d6c0;border-radius:16px;padding:6px 10px;display:flex;align-items:center;font-size:13px} .dm2-tag .x{margin-left:6px;cursor:pointer;font-weight:900} #in2TagInput{ margin-top:8px; } .dm2-suggest{list-style:none;margin:6px 0 0;padding:0;border:1.5px solid var(--dm-br);border-radius:12px;max-height:140px;overflow:auto;background:#fffdf8} .dm2-suggest li{padding:8px 10px;cursor:pointer} .dm2-suggest li:hover{background:#fff1e2} .dm2-photo{position:fixed;inset:0;background:rgba(0,0,0,.88);display:none;z-index:9000;align-items:center;justify-content:center} .dm2-photo.open{display:flex} .dm2-photo img{max-width:92vw;max-height:88vh;border-radius:12px;box-shadow:0 10px 28px rgba(0,0,0,.5)} .dm2-follow-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:9000;padding:env(safe-area-inset-top) 10px env(safe-area-inset-bottom)} .dm2-follow-modal.open{display:flex;align-items:center;justify-content:center} .dm2-follow-box{width:100%;max-width:540px;background:var(--dm-panel);border:2px solid var(--dm-br);border-radius:18px;box-shadow:var(--dm-shadow);max-height:80vh;overflow:auto} .dm2-follow-head{display:flex;align-items:center;justify-content:space-between;padding:12px;border-bottom:2px dashed var(--dm-br)} .dm2-follow-title{font-weight:900} .dm2-follow-close{background:none;border:2px solid var(--dm-br);border-radius:10px;padding:6px 10px;font-weight:900;cursor:pointer} .dm2-follow-list{padding:8px 6px} .dm2-user-row{display:flex;align-items:center;gap:10px;padding:8px;border-radius:12px;cursor:pointer} .dm2-user-row:hover{background:#fff1e2} .dm2-user-row img{width:42px;height:42px;border-radius:50%;object-fit:cover;border:2px solid var(--dm-br)} .dm2-user-text{min-width:0;flex:1} .dm2-user-name{font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .dm2-user-handle{font-size:12px;color:var(--dm-muted)} .dm2-mini-follow{ margin-left:auto;border:2px solid var(--dm-brand);border-radius:12px;padding:6px 10px;font-weight:900;background:#fff;color:#var(--dm-brand);cursor:pointer } .dm2-mini-follow.is-following{background:var(--dm-brand);color:#fff} .dm2-lock{ position:fixed !important; width:100% !important; overflow:hidden !important; left:0; right:0; } /* ===== Profil: HDM-Heading + Galerie (Insta-Grid) ===== */ .dm2-section-title{ font-size:16px; font-weight:900; margin:14px 6px 10px; color:var(--dm-ink); } .dm2-gallery{ margin-top:6px; } /* Insta-Grid Look: winzige Gutter, gleiche BG wie Seite, keine Außenrundung */ .dm2-gallery-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:2px; /* minilücke wie IG */ background:var(--dm-bg); /* gleiche Hintergrundfarbe */ border:none; border-radius:0; overflow:visible; } .dm2-gallery-item{ position:relative; padding:0; border:none; background:var(--dm-bg); aspect-ratio:4/5; /* länglicher (4:5 wie IG-Feed) */ cursor:pointer; } .dm2-gallery-item img{ width:100%; height:100%; object-fit:cover; display:block; border-radius:0 !important; /* NICHT abgerundet */ } /* Plus-Kachel blenden wir aus (Punkt 3 bringt FAB) */ .dm2-gallery-add{ display:none !important; } .dm2-gallery-add{ font-weight:900; font-size:30px; color:#b36c2e; display:flex; align-items:center; justify-content:center; background:#fff9f1; } .dm2-gallery-add:active{ transform:translateY(1px); } /* PG-Detail: Overlay über alles legen */ .pg-detail-overlay{ position:fixed; inset:0; z-index:2147483647 !important; /* über Bottom-Nav */ background:rgba(0,0,0,.88); display:none; } .pg-detail-overlay.open{ display:flex; } /* NUR das Profil-Overlay stylen – NICHT die globale HDM-Klasse */ .pg-detail-overlay .hdm-detail-scroll{ flex:1 1 auto; min-height:0; width:100%; height:100%; overflow-y:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain; display:flex; flex-direction:column; align-items:center; padding-bottom:calc(110px + env(safe-area-inset-bottom)); } @supports (height: 100dvh) { .pg-detail-overlay{ height:100dvh; } .pg-detail-overlay .hdm-detail-scroll{ min-height:100svh; } } .pg-detail-header{ display:flex; align-items:center; justify-content:space-between; width:100%; max-width:420px; padding:13px 15px 8px; box-sizing:border-box; border-bottom:1.2px solid #edc290; background:var(--dm-bg); } .pg-detail-title{ font-weight:900; color:var(--dm-ink); } .pg-detail-close{ background:none; border:none; font-size:27px; line-height:1; font-weight:900; cursor:pointer; color:var(--dm-brand); width:36px; height:36px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; } .pg-detail-close:hover{ background:#fff5e2; } .pg-detail-imgbox{ position:relative; display:flex; justify-content:center; align-items:center; width:100%; max-width:420px; margin:0 auto; background:#ffecd0; } .pg-detail-imgbox img{ display:block; width:auto; height:auto; max-width:100vw; max-height:calc(100vh - 220px); object-fit:contain; margin:0 auto; } .pg-detail-info{ width:100%; max-width:420px; padding:0 15px 16px; } .pg-detail-caption{ margin-top:8px; color:var(--dm-ink); font-size:14px; line-height:1.35; } /* Edge-Swipe */ .pg-detail-overlay .hdm-detail-scroll{ will-change: transform; } /* FAB für Profil-Upload (kleiner Kreis wie gewünscht) */ #dm2FabAdd{ position:fixed; right:16px; bottom:calc(env(safe-area-inset-bottom) + 82px + 12px); /* etwas über Bottom-Nav */ width:54px; height:54px; border-radius:999px; background:var(--dm-brand); color:#fff; font-weight:900; font-size:28px; line-height:1; border:2px solid var(--dm-brand); box-shadow:0 8px 26px rgba(0,0,0,.16); z-index:2147483645; display:flex; align-items:center; justify-content:center; } #dm2FabAdd:active{ transform:translateY(1px); } /* Profil-Galerie Detail nutzt HDM-Styles; minimal anpassen */ #pg-detail .hdm-detail-imgbox img{ border-radius:0; } #pg-detail .hdm-detail-header .profile{ cursor:pointer; } /* Kein horizontales Scrollen im Sheet + Date-Feld nicht zu breit (iOS) */ .dm2-sheet{ overflow-x:hidden; } .dm2-grid2{ overflow-x:hidden; } .dm2-date{ width:100%; min-width:0; } /* --- PG-Detail-Menü optisch 1:1 wie HDM --- */ .pg-detail-header .hdm-detail-header-actions{ position:relative; z-index:10120; } #pg-detail-menu{ position:absolute; top:48px; right:35px; background:#fff9f1; border-radius:13px; box-shadow:0 3px 14px #dbb57133; z-index:10110; padding:0; display:none; flex-direction:column; min-width:142px; border:1.2px solid #ffe1b8; } #pg-detail-menu button{ width:100%; background:none; border:none; color:var(--dm-ink); font-size:15px; font-family:'Merriweather',serif; padding:13px 12px; text-align:left; cursor:pointer; border-bottom:1px solid #f1dac2; transition:background .18s,color .17s; } #pg-detail-menu button:last-child{ border-bottom:none; } #pg-detail-menu button:hover{ background:#ffe6c7; color:#cc7255; } /* PG-Detail: 3-Punkte-Button exakt wie HDM, ohne grauen BG */ #pg-detail-menu-btn{ background:transparent !important; border:none !important; font-size:26px; line-height:1; color:var(--dm-brand); width:36px; height:36px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; -webkit-tap-highlight-color: transparent; } #pg-detail-menu-btn:hover{ background:#fff5e2; } .pg-detail-header .hdm-detail-header-actions{ display:flex; align-items:center; gap:7px; } /* --- HDM-Name + Like-Zeile in Profilkarten --- */ #dm2Profile .hdm-name-like-row{ display:flex; align-items:center; justify-content:space-between; padding:8px 10px; background:var(--dm-panel); border-top:2px dashed var(--dm-br); } #dm2Profile .hdm-dogname{ font-weight:900; font-size:14px; color:var(--dm-ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:65%; } #dm2Profile .hdm-likes{ display:inline-flex; align-items:center; gap:6px; border:2px solid var(--dm-br); border-radius:12px; padding:4px 8px; background:#fffdf8; cursor:pointer; } #dm2Profile .hdm-likes .heart{ display:inline-flex; line-height:0; } #dm2Profile .hdm-likes .heart-outline{ transition:fill .15s, stroke .15s; } #dm2Profile .hdm-likes.liked .heart-outline{ fill:var(--dm-brand); stroke:var(--dm-brand); } #dm2Profile .hdm-like-num{ font-weight:800; font-size:14px; color:var(--dm-ink); } /* PATCH: Likes/Herzen garantiert sichtbar + Overlays fressen keine Klicks */ #pg-detail-skeleton{ pointer-events:none; } /* falls Skeleton liegen bleibt */ .dm2-card, .dm2-gallery-item { position:relative; } .dm2-card img, .dm2-gallery-item img { display:block; opacity:1 !important; } #dm2Profile .hdm-likes{ display:inline-flex !important; align-items:center; gap:6px; } #dm2Profile .hdm-likes svg{ display:block !important; } #dm2Profile .hdm-like-num{ min-width:1ch; } </style> <!-- Profil-Galerie Detail (1:1 wie HDM) --> <div class="pg-detail-overlay" id="pg-detail" style="display:none"> <div class="hdm-detail-scroll"> <!-- nutzt HDM-Styles --> <div class="hdm-detail-header"> <div class="profile" id="pg-profile-link"> <img src="" alt="Profil" class="profile-img" id="pg-profile-img"> <span class="username" id="pg-profile-username"></span> </div> <div class="hdm-detail-header-actions"> <button id="pg-detail-menu-btn" title="Mehr Optionen">⋮</button> <button class="hdm-detail-close" id="pg-detail-close" title="Schließen">&times;</button> <div class="hdm-detail-menu-list" id="pg-detail-menu" style="display:none;"></div> </div> </div> <div class="hdm-detail-imgbox"> <img id="pg-detail-img" src="" alt="Foto"> <div id="pg-detail-skeleton" style="position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(255,230,199,.6);backdrop-filter:blur(1px)"> <div style="padding:10px 14px;border-radius:12px;border:2px dashed #d7a77a;background:#fff9f1;font-weight:900">lädt…</div> </div> </div> <div class="hdm-detail-info"> <div class="hdm-detail-caption" id="pg-detail-caption-row"></div> <div class="hdm-detail-comments" id="pg-detail-comments"></div> </div> </div> </div> <div class="dm2-wrap" id="dm2Profile"> <div class="dm2-head" id="dm2Head"> <div class="dm2-cover" id="dm2Cover" title="Banner hochladen"></div> <button class="dm2-share" id="dm2Share" aria-label="Profil teilen"></button> <button class="dm2-gear" id="dm2Gear" aria-haspopup="menu"></button> <div class="dm2-menu" id="dm2Menu" role="menu"> <h4>Einstellungen</h4> <button id="dm2EditBtn">🐾 Hundeprofil bearbeiten</button> <button id="dm2EditAvatar">📸 Profilbild ändern</button> <button id="dm2Membership">💳 Mitgliedschaft bearbeiten</button> <button id="dm2Logout">🚪 Abmelden</button> </div> <div class="dm2-row"> <div class="dm2-left"> <div class="dm2-avatar"><img id="dm2Avatar" src="https://via.placeholder.com/200x200.png?text=Doggo" alt="Profilbild"></div> <div class="dm2-badges-left"> <span class="dm2-badge" id="dm2Age">–</span> <span class="dm2-badge" id="dm2Breed">Lieblingsfell</span> </div> <button class="dm2-follow" id="dm2FollowBtn" style="display:none">Folgen</button> </div> <div class="dm2-right"> <div class="dm2-toprow"> <h2 class="dm2-name" id="dm2Name">Dein Hund</h2> <div class="dm2-handle" id="dm2Handle">@doggo</div> </div> <div class="dm2-bio" id="dm2Bio" style="display:none"></div> </div> </div> <div class="dm2-stats"> <div class="dm2-stat"><a id="openPosts"><b id="dm2PostsCount">0</b><span>Beiträge</span></a></div> <div class="dm2-stat"><a id="openFollowers"><b id="dm2Followers">–</b><span>Follower</span></a></div> <div class="dm2-stat"><a id="openFollowing"><b id="dm2Following">–</b><span>Folgt</span></a></div> </div> </div> <div class="dm2-tabs"> <button class="dm2-tab active" data-tab="posts">Beiträge</button> <button class="dm2-tab" data-tab="about">Info</button> </div> <div class="dm2-panels"> <div class="dm2-panel active" id="dm2Tab-posts"> <!-- HDM-Bereich (nur sichtbar, wenn es mind. 1 HDM-Post gibt) --> <div id="dm2HdmSection" style="display:none"> <h3 class="dm2-section-title">Hund des Monats Beitrag</h3> <div class="dm2-grid" id="dm2HdmGrid"></div> </div> <!-- Profil-Galerie (Insta-Grid, 3 Spalten, nahtlos) --> <div class="dm2-gallery"> <div class="dm2-gallery-grid" id="dm2GalleryGrid"> <!-- Upload-Teaser als erste Kachel --> <button class="dm2-gallery-add" id="dm2GalleryAdd" title="Foto hochladen">+</button> </div> <input type="file" id="dm2GalleryFile" accept="image/*" style="display:none"> </div> </div> <!-- FAB: schwebendes + zum Hochladen --> <button id="dm2FabAdd" aria-label="Foto hochladen">+</button> <div class="dm2-panel" id="dm2Tab-about"> <div class="dm2-about"> <dl> <dt>Name</dt><dd id="ab2Name">–</dd> <dt>Geschlecht</dt><dd id="ab2Sex">–</dd> <dt>Geburtstag</dt><dd id="ab2Birth">–</dd> <dt>Alter</dt><dd id="ab2Age">–</dd> <dt>Rasse</dt><dd id="ab2Breed">–</dd> <dt class="dm2-private" data-private="1">Gewicht</dt><dd class="dm2-private" data-private="1" id="ab2Weight">–</dd> <dt class="dm2-private" data-private="1">Endgewicht</dt><dd class="dm2-private" data-private="1" id="ab2Goal">–</dd> <dt class="dm2-private" data-private="1">Allergien</dt><dd class="dm2-private" data-private="1" id="ab2Allergies">–</dd> </dl> <div style="margin-top:8px;color:var(--dm-muted);font-size:12px">Hinweis: Einige Angaben (z. B. Gewicht, Allergien) sind privat.</div> </div> </div> </div> </div> <div class="dm2-modal" id="dm2Modal"> <div class="dm2-sheet" id="dm2Sheet"> <h3 style="margin:0 0 8px">Hundeprofil bearbeiten</h3> <div class="dm2-grid2"> <div class="dm2-field"> <label>Bio</label> <textarea class="dm2-text" id="in2Bio" placeholder="Schreibe etwas über deinen Hund 🐾 (max. 70 Zeichen)"></textarea> <div class="dm2-count" id="bioCount">0/70</div> </div> <div class="dm2-field"><label>Gewicht (kg)</label><input class="dm2-inp" id="in2Weight" type="number" min="0" step="0.1"></div> <div class="dm2-field"> <label>Kastriert?</label> <select class="dm2-sel" id="in2Neutered"><option value="">Bitte auswählen</option><option>Ja</option><option>Nein</option></select> </div> <div class="dm2-field"><label>Geburtsdatum</label><input class="dm2-date" id="in2Birth" type="date"></div> <div class="dm2-field"><label>Erwartetes Endgewicht (kg)</label><input class="dm2-inp" id="in2Goal" type="number" min="0"></div> <div class="dm2-field"> <label>Allergien / Unverträglichkeiten</label> <div class="dm2-tags" id="in2Tags"></div> <input class="dm2-inp" id="in2TagInput" placeholder="Allergie suchen…"> <ul class="dm2-suggest" id="in2Suggest" style="display:none;"></ul> </div> </div> <div class="dm2-actions-row"> <button class="dm2-btn" id="dm2Cancel">Abbrechen</button> <button class="dm2-btn brand" id="dm2Save">Speichern</button> </div> </div> </div> <div class="dm2-photo" id="dm2Photo"><img id="dm2PhotoImg" src="" alt="Profilbild"></div> <div class="dm2-follow-modal" id="dm2FollowModal" aria-hidden="true"> <div class="dm2-follow-box"> <div class="dm2-follow-head"> <div class="dm2-follow-title" id="fTitle">Follower</div> <button class="dm2-follow-close" id="closeFollowModal">Schließen</button> </div> <div class="dm2-follow-list" id="listFollowers"></div> <div class="dm2-follow-list" id="listFollowing" style="display:none;"></div> </div> </div> <input id="dm2File" type="file" accept="image/*" style="display:none"> <input id="dm2FileCover" type="file" accept="image/*" style="display:none"> Hund des monats <style> :root{ --bg-page:#ffe6c7; --bg-card:#ffecd0; --bg-section:#fff9f1; --clr-primary:#d77f47; --clr-primary-hover:#c96f3f; --clr-text:#3a2d1a; --clr-muted:#b36c2e; --font-heading:'Merriweather',serif; --font-body:'Merriweather',serif; } html.modal-open, body.modal-open{ overflow:hidden !important; position:fixed; width:100%; height:100%; touch-action:none; /* iOS Touch-Scroll blocken */ overscroll-behavior:none; /* Bounce/Chaining verhindern */ } /* --- Teaser --- */ .hdm-box{ display:flex;align-items:center;justify-content:space-between; background:var(--bg-card);border-radius:22px;padding:20px 28px 20px 22px; box-shadow:0 8px 28px rgba(0,0,0,.07);margin-bottom:26px; } .hdm-text{flex:1;text-align:center;} .hdm-text h2{margin:0 0 8px;font-size:20px;font-family:var(--font-heading);font-weight:bold;} .hdm-text a{ display:inline-block;background:var(--clr-primary);color:#fff; padding:8px 16px;border-radius:12px;font-weight:bold;font-size:15px;text-decoration:none;transition:background .2s; } .hdm-text a:hover{background:var(--clr-primary-hover);} .hdm-img img{width:78px;height:auto;} /* --- Overlays --- */ .hdm-overlay,.hdm-detail-overlay{ position:fixed;inset:0;width:100vw;height:100vh;z-index:9999; background:var(--bg-page);display:none;flex-direction:column; } .hdm-overlay-active{display:flex!important;} .hdm-overlay-scroll,.hdm-detail-scroll{ flex:1 1 auto;min-height:0;width:100%;height:100%; overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain; display:flex;flex-direction:column;align-items:center; padding-top:env(safe-area-inset-top); padding-bottom:calc(110px + env(safe-area-inset-bottom)); /* genug Platz über der Bottom-Nav */ } /* --- Galerie Kopf --- */ .hdm-gallery-titlebox{ display:flex;align-items:center;justify-content:center;gap:14px; background:var(--bg-card);border-radius:22px;padding:22px 0; margin: calc(58px + env(safe-area-inset-top)) 0 18px; /* etwas unter dem Zurück-Button */ width:100vw;max-width:none;box-shadow:0 8px 28px rgba(0,0,0,.10); } .hdm-gallery-titlebox .hdm-text{ flex:1 1 0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;min-width:0;padding:0; } .hdm-gallery-titlebox .hdm-text h2{ margin:0 0 8px 0;font-size:20px;font-weight:bold;font-family:var(--font-heading);letter-spacing:.01em;color:var(--clr-text);line-height:1.13; } .hdm-gallery-titlebox .hdm-info-btn, .hdm-gallery-titlebox .hdm-text a{ margin:0;font-size:15px;font-family:var(--font-heading);font-weight:bold;padding:9px 14px; background:var(--clr-primary);color:#fff;border:none;border-radius:12px;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap; box-shadow:0 2px 8px rgba(220,120,40,.09);transition:background .18s; } .hdm-gallery-titlebox .hdm-info-btn:hover, .hdm-gallery-titlebox .hdm-text a:hover{background:var(--clr-primary-hover);} .hdm-gallery-titlebox .hdm-img{display:flex;align-items:center;justify-content:center;flex:0 0 auto;} .hdm-gallery-titlebox .hdm-img img{width:78px;height:auto;object-fit:contain;margin-top:0;border-radius:18px;background:none!important;box-shadow:none!important;} @media (max-width:600px){ .hdm-gallery-titlebox{padding:16px 0;} .hdm-gallery-titlebox .hdm-text h2{font-size:18px;} .hdm-gallery-titlebox .hdm-info-btn, .hdm-gallery-titlebox .hdm-text a{font-size:14px;padding:8px 12px;} } @media (max-width:420px){ .hdm-gallery-titlebox{padding:10px 0;gap:6px;} .hdm-gallery-titlebox .hdm-text h2{font-size:16px;} .hdm-gallery-titlebox .hdm-info-btn, .hdm-gallery-titlebox .hdm-text a{font-size:13.5px;padding:8px 11px;} } /* --- Grid & Karten --- */ .hdm-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;padding:0 14px 110px;width:100%;max-width:480px;} .hdm-card{background:transparent;border-radius:22px;overflow:visible;position:relative;display:flex;flex-direction:column;align-items:stretch;} .hdm-card img{width:100%;height:180px;object-fit:cover;display:block;border-radius:22px 22px 0 0;} .hdm-name-like-row{ display:flex;justify-content:space-between;align-items:center; padding:12px 17px 11px 15px;background:#f9f5e9;border-radius:0 0 22px 22px;min-height:54px; box-shadow:0 2px 8px rgba(0,0,0,.05);margin-top:-6px;margin-bottom:0;width:100%;position:relative;z-index:2; } .hdm-dogname{ font-family:var(--font-heading);font-size:18px;font-weight:800;color:#a54f0b; white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;display:flex;align-items:center; } .hdm-likes{ font-size:18px;font-weight:700;color:#d77f47;background:none;border-radius:18px;padding:0 0 0 10px;display:flex;align-items:center;margin:0;border:none;box-shadow:none;transition:color .18s;cursor:pointer;min-width:44px;justify-content:flex-end; } .hdm-likes.liked{color:#ff3939;} .hdm-card .heart,.hdm-detail-likes .heart{width:23px;height:23px;display:inline-flex;align-items:center;justify-content:center;margin-right:6px;} .hdm-card .hdm-likes .heart-outline{fill:none;stroke:#d77f47;stroke-width:2.3;} .hdm-card .hdm-likes.liked .heart-outline{fill:#ff3939;stroke:#ff3939;} /* --- Upload-Button --- */ .hdm-upload{ position:fixed;bottom:34px;left:16px;right:16px;background:var(--clr-primary);color:#fff;padding:16px; text-align:center;font-weight:bold;border-radius:18px;font-size:18px;cursor:pointer;z-index:10000; box-shadow:0 2px 10px #fff7,0 8px 32px rgba(0,0,0,.09);transition:background .2s;font-family:var(--font-heading); } .hdm-upload:hover{background:var(--clr-primary-hover);} /* --- Back --- */ .btn-back{ position:fixed;top:calc(env(safe-area-inset-top) + 12px);left:16px;background:var(--bg-section);color:var(--clr-text); padding:9px 14px 9px 8px;border-radius:22px;font-size:16px;font-family:var(--font-body);box-shadow:0 2px 6px rgba(0,0,0,.1); z-index:10000;cursor:pointer;display:flex;align-items:center;gap:7px;border:none;outline:none; } .btn-back:hover{background:var(--clr-primary-hover);} /* --- Detail --- */ .hdm-detail-header{ display:flex;align-items:center;justify-content:space-between;width:100%;max-width:420px; padding:13px 15px 8px;background:var(--bg-page);box-sizing:border-box;border-bottom:1.2px solid #edc290; } .hdm-detail-header .profile{display:flex;align-items:center;gap:10px;} .hdm-detail-header .profile-img{width:38px;height:38px;border-radius:50%;object-fit:cover;background:#f9f5e9;border:1.5px solid #e2b37c;} .hdm-detail-header .username{font-weight:700;font-size:15px;color:#var(--clr-primary);letter-spacing:.01em;} .hdm-detail-header-actions{display:flex;align-items:center;gap:7px;} #hdm-detail-menu-btn{background:none;border:none;font-size:26px;color:var(--clr-primary);cursor:pointer;margin:0;padding:0;} .hdm-detail-close{ background:none!important;border:none!important;font-size:27px!important;line-height:1!important;font-weight:900!important; font-family:var(--font-heading)!important;color:var(--clr-primary)!important;width:36px;height:36px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center; } .hdm-detail-close:hover{background:#fff5e2!important;color:var(--clr-primary-hover)!important;} #hdm-detail-menu-list{ position:absolute;top:48px;right:35px;background:#fff9f1;border-radius:13px;box-shadow:0 3px 14px #dbb57133;z-index:10110;padding:0;display:none;flex-direction:column;min-width:142px;border:1.2px solid #ffe1b8; } #hdm-detail-menu-list button{ width:100%;background:none;border:none;color:var(--clr-text);font-size:15px;font-family:var(--font-heading); padding:13px 12px;text-align:left;cursor:pointer;border-bottom:1px solid #f1dac2;transition:background .18s,color .17s; } #hdm-detail-menu-list button:last-child{border-bottom:none;} #hdm-detail-menu-list button:hover{background:#ffe6c7;color:#d77f47;} .hdm-detail-imgbox{ position:relative;display:flex;justify-content:center;align-items:center;width:100%;max-width:420px;margin:0 auto;background:var(--bg-card);border-radius:0;padding:0; } /* Wichtig: von Anfang an ohne Ränder */ .hdm-detail-imgbox img{ display:block;width:auto;height:auto;max-width:100vw; max-height:calc(100vh - 220px); /* Platz für Header/Actions */ object-fit:contain;background:var(--bg-card);margin:0 auto;border-radius:0;box-shadow:0 2px 8px #e6b8881a; } .hdm-detail-actions{display:flex;align-items:center;gap:22px;padding:12px 15px 1px;width:100%;max-width:420px;font-size:1.47em;} .hdm-detail-actions .icon-btn{background:none;border:none;cursor:pointer;color:var(--clr-primary);font-size:1.15em;padding:0;display:flex;align-items:center;} .hdm-detail-actions .icon-btn.liked svg path{fill:#ff3939!important;stroke:#ff3939!important;} .hdm-detail-likecount{display:none!important;} .hdm-detail-info{width:100%;max-width:420px;padding:0 15px;margin-bottom:18px;} .hdm-detail-caption{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;margin:6px 0 0;color:var(--clr-text);} .hdm-caption-username{font-weight:900;font-size:14px;color:var(--clr-primary);} .hdm-caption-wrap{position:relative;display:inline-block;max-width:100%;} .hdm-caption-text{ font-size:14px;color:var(--clr-text);font-weight:400;line-height:1.35;white-space:normal!important; padding-right:46px;display:-webkit-box;-webkit-box-orient:vertical; } .caption-more-btn{ background:none;color:inherit;font:inherit;font-size:14.5px;font-weight:800;border:none;margin:0;cursor:pointer; position:absolute;right:0;bottom:0;line-height:1.35;padding-left:6px; } .caption-truncate{-webkit-line-clamp:2;overflow:hidden;text-overflow:ellipsis;max-height:2.7em;} .caption-save-btn{ background:var(--clr-primary);color:#fff;border:none;padding:9px 14px;border-radius:12px; font-family:var(--font-heading);font-size:14px;font-weight:800;cursor:pointer;box-shadow:0 2px 8px rgba(220,120,40,.15); transition:background .18s,transform .05s; } .caption-save-btn:hover{background:var(--clr-primary-hover);} .caption-save-btn:active{transform:translateY(1px);} .caption-add-btn{ background:#fffdf8;color:var(--clr-muted);border:1.1px dashed var(--clr-muted);padding:8px 12px;border-radius:11px; font-family:var(--font-heading);font-size:14px;font-weight:800;cursor:pointer;transition:background .17s,color .17s,border-color .17s,transform .05s; } .caption-add-btn:hover{background:#fff5e2;color:var(--clr-primary);border-color:var(--clr-primary);} .caption-add-btn:active{transform:translateY(1px);} /* Like-Burst */ .hdm-like-burst{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0;animation:hdmPop 750ms ease-out forwards;} .hdm-like-burst svg{width:120px;height:120px;} @keyframes hdmPop{ 0%{transform:scale(.6);opacity:0;} 15%{transform:scale(1.2);opacity:1;} 40%{transform:scale(1);opacity:1;} 100%{transform:scale(1);opacity:0;} } /* Kleines Flaggen-Icon (Kommentare melden) */ .dgm-report-btn{background:none;border:none;font-size:16px;line-height:1;cursor:pointer;color:#b1452b;padding:4px;border-radius:8px;} .dgm-report-btn:hover{background:#ffe9d9;} .like-number{margin-left:7px;font-weight:500;font-size:15px;color:inherit;line-height:1;} </style> <!-- HDM Styles (Bottom-Nav Fixes & Info-X) --> <style> /* Overlays unter die Bottom-Nav legen */ .hdm-overlay{ z-index: 9998; } .hdm-detail-overlay{ z-index: 9999; } .bottom-nav{ z-index: 2147483647 !important; } /* Platz nach unten für Bottom-Nav */ .hdm-overlay-scroll{ padding-bottom: calc(100px + env(safe-area-inset-bottom)); } /* Upload-Button fest über der Bottom-Nav */ /* Upload-Button: kleiner, mittig, mit Schwebe + etwas Luft über der Bottom-Nav */ .hdm-upload{ position: fixed; left:50%; transform: translateX(-50%) translateY(var(--fab-lift,0)); bottom: calc(env(safe-area-inset-bottom) + 82px + 12px); /* +12px Abstand zur Nav */ z-index: 2147483645; display:block; background:var(--clr-primary); color:#fff; font-family:var(--font-heading); font-weight:800; font-size:16px; /* kleiner */ line-height:1; padding:12px 16px; /* kleiner */ border-radius:16px; min-width:210px; width:max-content; max-width:calc(100vw - 32px); text-align:center; box-shadow:0 2px 10px #fff7, 0 10px 26px rgba(0,0,0,.12); transition:transform .18s ease, box-shadow .18s ease, background .2s ease; } .hdm-upload:hover{ background:var(--clr-primary-hover); } /* Schwebe beim Scrollen */ .hdm-upload.is-scrolling{ --fab-lift:-4px; box-shadow:0 6px 18px #fff7, 0 18px 36px rgba(0,0,0,.18); } /* So funktioniert’s – Close-X rechts, ohne Verzögerung */ /* ECHTES Modal mit Backdrop */ /* Modal über Upload-Button legen (aber unter Bottom-Nav, falls gewünscht) */ #hdm-info-modal{ position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.38); backdrop-filter: blur(1.5px); z-index: 2147483646; /* > Upload (2147483645) */ padding: 16px; } #hdm-info-modal.active{ display:flex !important; } #hdm-info-modal .hdm-info-modal-content{ position: relative; max-width: 540px; width: min(540px, 92vw); /* etwas schmaler */ background:#fff9f1; border:2px solid #efb876; border-radius:14px; padding:16px 16px 14px; /* kompakter */ box-shadow: 0 18px 60px rgba(0,0,0,.25); line-height:1.35; } #hdm-info-modal .hdm-info-modal-content h3{ margin:0; /* Header nach oben, bündig mit dem X */ line-height:1; /* optisch auf gleicher Höhe */ padding-right:44px; /* Platz für das X rechts */ font-size:18px; /* kleiner */ } .hdm-info-close{ position:absolute; top:10px; right:10px; width:32px; height:32px; border-radius:999px; background:#fff; border:2px solid #efb876; font-size:18px; line-height:24px; cursor:pointer; } .hdm-info-close:hover{ background:#fff1e2; } .hdm-howto{ margin:12px 0 6px; padding-left:20px; } .hdm-howto li{ margin:8px 0 10px; } .hdm-howto, .hdm-howto .small{ font-size:14px; } /* Text kleiner */ .hdm-howto .small{ opacity:.8; } .hdm-howto .accent-win{ color:#a54f0b; } .hdm-info-modal-content a{ text-decoration:none; font-weight:800; } .hdm-info-modal-content a:hover{ text-decoration:underline; } /* farbige Links */ .hdm-info-modal-content a.btn-ig{ color:#d62976; } /* Instagram */ .hdm-info-modal-content a.btn-legal{ color:#c96f3f; } /* AGB/Datenschutz */ /* ===== Detailbild: Fix gegen 0px-Höhe ===== */ .hdm-detail-scroll{ display:flex; flex-direction:column; /* kein fixes height:100vh; sonst kollabiert die Bildhöhe */ min-height: 100vh; padding:0; padding-bottom: calc(110px + env(safe-area-inset-bottom)); /* sichtbar über Bottom-Nav hinaus */ } .hdm-detail-imgbox{ /* nicht schrumpfen lassen */ flex: 0 0 auto; display:flex; align-items:center; justify-content:center; padding:0; margin:0; position:relative; min-height:0; } .hdm-detail-imgbox img{ display:block; width:auto; height:auto; max-width:100vw; max-height: calc(100vh - 220px); /* Platz für Header/Actions */ object-fit: contain; margin:0; padding:0; } /* (optional) Snackbar-Style */ #doggomeal-snackbar{ position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%) translateY(20px); background:#3a2d1a; color:#fff; border-radius:10px; padding:10px 14px; font-weight:700; font-size:14px; box-shadow:0 10px 26px rgba(0,0,0,.2); opacity:0; pointer-events:none; transition: all .25s ease; z-index:2147483646; display:flex; gap:8px; align-items:center; } #doggomeal-snackbar.show{ opacity:1; transform: translateX(-50%) translateY(0); } /* Like-Burst */ .hdm-like-burst{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; animation: hdm-burst 600ms ease forwards; pointer-events:none; } @keyframes hdm-burst{ 0%{ transform: scale(.7); opacity:.0; } 20%{ transform: scale(1); opacity:.9; } 100%{ transform: scale(1.35); opacity:0; } } /* Klick-Hinweis auf Profilzeile im Detail (optional Cursor) */ .hdm-detail-header .profile{ cursor:pointer; } </style> <style> /* --- FIX: Close-X kein weißer Tap-Kreis + stets oben drüber --- */ .hdm-detail-header-actions{ position: relative; /* eigener Stacking-Context */ z-index: 10120; /* über dem Menü-Panel */ } .hdm-detail-close{ position: relative; z-index: 10130; /* sicher ÜBER Menü */ background: transparent !important; border: none !important; outline: none !important; box-shadow: none !important; -webkit-tap-highlight-color: transparent; /* iOS: kein weißer Tap-Kreis */ } .hdm-detail-close:focus{ outline: none !important; } .hdm-detail-close:active{ background: transparent !important; } /* Menü bleibt darunter, damit Klick aufs X nicht zuerst das Menü trifft */ #hdm-detail-menu-list{ z-index: 10110; } /* Force brand colors in the modal */ #hdm-info-modal .hdm-info-modal-content a.btn-ig:link, #hdm-info-modal .hdm-info-modal-content a.btn-ig:visited{ color:#d62976 !important; } #hdm-info-modal .hdm-info-modal-content a.btn-legal:link, #hdm-info-modal .hdm-info-modal-content a.btn-legal:visited{ color:#c96f3f !important; } </style> <!-- PREHIDE gegen Startscreen-Flash bei Deep-Link --> <div id="dgm-prehide" style="position:fixed;inset:0;background:#ffe6c7;z-index:2147483646;display:none"></div> <script> (function(){ try{ if(new URLSearchParams(location.search).has('post')){ var d=document.getElementById('dgm-prehide'); if(d) d.style.display='block'; document.documentElement.setAttribute('data-hdm-deeplink','1'); // Flag für spätere Entfernung } }catch(_){}})(); </script> <!-- Teaser --> <div class="hdm-box"> <div class="hdm-text"> <h2>Hund des Monats</h2> <a href="#" id="hdm-open">Jetzt abstimmen</a> </div> <div class="hdm-img"> <img src="https://cdn.prod.website-files.com/680f4e658c43b69c9bd0c7d3/6837261d5d96dd796e0c1f06_Hund%20des%20monats.png" alt="Hund des Monats" /> </div> </div> <!-- Galerie-Overlay --> <div class="hdm-overlay" id="hdm-overlay" style="display:none;"> <div class="hdm-overlay-scroll"> <div class="btn-back" id="hdm-back">← Zurück</div> <div class="hdm-gallery-titlebox hdm-banner-match"> <div class="hdm-text"> <h2>Hund des Monats</h2> <button class="hdm-info-btn" id="hdm-info-btn">📸 So funktioniert’s</button> </div> <div class="hdm-img"> <img src="https://cdn.prod.website-files.com/680f4e658c43b69c9bd0c7d3/6837261d5d96dd796e0c1f06_Hund%20des%20monats.png" alt="Hund des Monats" /> </div> </div> <div id="hdm-info-modal" style="display:none;"> <div class="hdm-info-modal-content"> <button class="hdm-info-close" id="hdm-info-close" aria-label="Schließen">&times;</button> <h3>📸 So funktioniert’s</h3> <ul class="hdm-howto"> <li>🐾 Lade ein Bild von deinem Doggo hoch.<br><span class="small">(Nur 1 Bild pro Monat – du kannst es jederzeit löschen & neu hochladen!)</span></li> <li>👍 Sammle Likes von der Community. Das meistgelikte Foto gewinnt <b class="accent-win">6 Monate DoggoMeal Premium!</b> 🏆</li> <li>⏰ <b>Jeden Monat um 00:00</b> wird alles zurückgesetzt – dann geht’s von vorne los.</li> <li>✨ Das Gewinnerbild wird auf unserem <a class="btn-ig" href="https://www.instagram.com/doggomeal.de" target="_blank" rel="noopener noreferrer">Instagram</a> geteilt 🎉 </li> <li>🔗 Mit dem Upload bestätigst du, dass du alle Rechte am Foto hast &amp; den <a class="btn-legal" href="/agb" target="_blank" rel="noopener noreferrer">Teilnahmebedingungen (AGB)</a> &amp; <a class="btn-legal" href="/datenschutzerklaerung" target="_blank" rel="noopener noreferrer">Datenschutz</a> zustimmst. </li> </ul> <div class="hdm-howto-note small">Hinweis: Dein Bild bleibt öffentlich sichtbar, bis du es selbst löschst oder uns kontaktierst.</div> </div> </div> <div class="hdm-grid" id="hdm-grid"></div> <div class="hdm-upload" id="hdm-upload">Bild hochladen</div> <input type="file" id="hdm-file" accept="image/*" style="display:none;"> </div> </div> <!-- Detail-Overlay --> <div class="hdm-detail-overlay" id="hdm-detail-overlay" style="display:none;"> <div class="hdm-detail-scroll"> <div class="hdm-detail-header"> <div class="profile" id="hdm-profile-link"> <img src="" alt="Profil" class="profile-img" id="hdm-profile-img"> <span class="username" id="hdm-profile-username"></span> </div> <div class="hdm-detail-header-actions"> <button id="hdm-detail-menu-btn" title="Mehr Optionen">⋮</button> <button class="hdm-detail-close" id="hdm-detail-close" title="Schließen">&times;</button> <div class="hdm-detail-menu-list" id="hdm-detail-menu-list" style="display:none;"></div> </div> </div> <div class="hdm-detail-imgbox"> <img id="hdm-detail-img" src="" alt="Hund des Monats Detailbild"> <!-- Skeleton/Loader --> <div id="hdm-detail-skeleton" style="position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(255,230,199,.6);backdrop-filter:blur(1px)"> <div style="padding:10px 14px;border-radius:12px;border:2px dashed #d7a77a;background:#fff9f1;font-weight:900">lädt…</div> </div> </div> <div class="hdm-detail-actions"> <button class="icon-btn" id="hdm-detail-likebtn" title="Gefällt mir"></button> </div> <div class="hdm-detail-info"> <div class="hdm-detail-likecount" id="hdm-detail-likecount"></div> <div class="hdm-detail-caption" id="hdm-detail-caption-row"></div> <div class="hdm-detail-comments" id="hdm-detail-comments"></div> </div> </div> </div> <div id="doggomeal-snackbar"></div> <script> /* =========================================================== DOGGOMEAL — Hund des Monats (Fixpack) - Deep-Link: sofort Detail-Skeleton => kein Startscreen-Flash - Likes: Pending-Guard + Clamping => niemals -1 - Profilklick öffnet /user?uid=... - Bild-Fallbacks gegen „weißes Bild“ - Edge-Swipe Jump-Guard =========================================================== */ console.log('DOGGOMEAL HDM – Fixpack vNext'); // Sichtbarkeit der Like-Zahl sicherstellen (falls externes CSS es versteckt) (function ensureLikeNumStyles(){ try{ if (document.getElementById('hdm-like-num-style')) return; const s = document.createElement('style'); s.id='hdm-like-num-style'; s.textContent = '.hdm-likes .hdm-like-num{display:inline-block;margin-left:6px;font-weight:600}'; document.head.appendChild(s); }catch(_){} })(); const APP_HOME = '/rezepte'; /* ---------- Scroll-Lock (mit Lock-Counter) ---------- */ let scrollY = 0, _wheelBlocker = null, _keyBlocker = null, _lockCount = 0; function lockScroll(){ if (_lockCount === 0){ // Erst beim ersten Lock wirklich sperren scrollY = window.scrollY || document.documentElement.scrollTop || 0; document.documentElement.classList.add('modal-open'); document.body.classList.add('modal-open'); document.body.style.top = -${scrollY}px; // Desktop: Wheel blocken außerhalb der Overlay-Scroller if(!_wheelBlocker){ _wheelBlocker = (e)=>{ if (e.target.closest('.hdm-overlay-scroll, .hdm-detail-scroll, .hdm-info-modal-content')) return; e.preventDefault(); }; window.addEventListener('wheel', _wheelBlocker, { passive:false }); } // Tastatur-Scroll blocken (Space, PgUp/Down, Arrow, Home/End) if(!_keyBlocker){ const keys = new Set([' ','Spacebar','PageUp','PageDown','ArrowUp','ArrowDown','Home','End']); _keyBlocker = (e)=>{ if (!keys.has(e.key)) return; if (e.target.closest('textarea, input, [contenteditable="true"]')) return; if (e.target.closest('.hdm-overlay-scroll, .hdm-detail-scroll, .hdm-info-modal-content')) return; e.preventDefault(); }; window.addEventListener('keydown', _keyBlocker, { passive:false }); } } _lockCount++; } function unlockScroll(){ if (_lockCount > 0) _lockCount--; if (_lockCount > 0) return; // noch andere Overlays halten den Lock // Jetzt wirklich freigeben document.documentElement.classList.remove('modal-open'); document.body.classList.remove('modal-open'); document.body.style.top = ''; window.scrollTo(0, scrollY); if(_wheelBlocker){ window.removeEventListener('wheel', _wheelBlocker); _wheelBlocker = null; } if(_keyBlocker){ window.removeEventListener('keydown', _keyBlocker); _keyBlocker = null; } } /* ---------- Snackbar ---------- */ function showDoggoSnackbar(msg){ const bar = document.getElementById('doggomeal-snackbar'); if (!bar) return alert(msg); bar.innerHTML = <span class="doggo-icon">🐶</span> <span>${msg}</span>; bar.classList.add('show'); setTimeout(() => { bar.classList.remove('show'); }, 3400); } /* ---------- Utils ---------- */ function QS(){ /* <-- zurück! */ try { return new URLSearchParams(location.search); } catch { return new URLSearchParams(''); } } function clampLikes(n){ n=parseInt(n,10); if(isNaN(n)||n<0) return 0; return n; } // --- LIKE-Normierung (zeigt sofort die richtigen Werte aus dem RPC) --- function _normLikes(p){ const n = p && (p.likes ?? p.likes_count ?? p.like_count ?? p.likeTotal ?? p.total_likes ?? null); return clampLikes(n); } function _normLiked(p){ return !!(p?.liked ?? p?.liked_by_me ?? p?.user_liked ?? p?.has_liked ?? false); } function normalizePic(p){ if (!p) return p; const q = { ...p }; q.likes = _normLikes(p); q.liked = _normLiked(p); return q; } function getLikes(p){ return _normLikes(p); } // Prüft, ob im Pic eine brauchbare Like-Zahl steckt (nicht nur ein leeres Feld) function hasReliableLikeCount(p){ const keys = ['likes','likes_count','like_count','likeTotal','total_likes']; for (const k of keys){ if (Object.prototype.hasOwnProperty.call(p || {}, k)){ const v = p[k]; if (typeof v === 'number' && Number.isFinite(v)) return true; if (typeof v === 'string' && v.trim() !== '' && !isNaN(parseInt(v,10))) return true; // Feld ist vorhanden, aber unbrauchbar -> nicht zuverlässig return false; } } return false; // gar kein Feld vorhanden } /* Bild-Fallback (gegen „weißes Bild“ / temporäre 404) */ function wireImgFallback(img){ if(!img) return; img.loading = img.loading || 'lazy'; img.decoding = img.decoding || 'async'; let retried = false; function bustCache(){ try{ const u = new URL(img.src, location.origin); u.searchParams.set('v', Date.now()); img.src = u.toString(); }catch(_){ img.src = (img.src || '') + ((img.src || '').includes('?') ? '&' : '?') + 'v=' + Date.now(); } } img.onerror = ()=>{ if (retried){ img.src = 'https://via.placeholder.com/900x900.png?text=Doggo'; return; } retried = true; bustCache(); }; // „weißes Bild ohne Fehler“ abfangen img.onload = ()=>{ if (!img.naturalWidth || !img.naturalHeight){ if (!retried){ retried = true; bustCache(); } else { img.src = 'https://via.placeholder.com/900x900.png?text=Doggo'; } } }; // Spät-Check (falls weder load noch error feuern) setTimeout(()=>{ if (!img.complete || !img.naturalWidth){ if (!retried){ retried = true; bustCache(); } } }, 2000); } /* ---------- Ready (Supabase + Memberstack + DOM) ---------- */ function whenReady(){ return new Promise(resolve => { function check(){ if (window.supabase && window.$memberstackDom && document.getElementById('hdm-open')) resolve(); else setTimeout(check, 60); } if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', check, { once:true }); else check(); }); } async function getMemberNormalized(){ try{ const res = await window.$memberstackDom.getCurrentMember(); const d = res?.data; const m = d?.member ? d.member : d; return { id: m?.id || null, customFields: m?.customFields || {} }; }catch{ return { id:null, customFields:{} }; } } /* ---------- URL / Deep-Link ---------- */ function normalizeUrl(u){ if(!u) return ''; try{ const url = new URL(u, location.origin); url.hash=''; url.search=''; return url.toString(); } catch { return String(u).trim(); } } function isUrlish(s){ return /^(?:[a-z]+:)?\/\//i.test(s) || s.startsWith('/') || /\.(png|jpe?g|gif|webp|avif)(\?|$)/i.test(s); } function buildUrlWithPost(post){ const u = new URL(location.href); if (post==null || post==='') u.searchParams.delete('post'); else u.searchParams.set('post', String(post)); if (!u.hash || u.hash==='#') u.hash='community'; return u.toString(); } function updateUrlPost(post, mode='replace'){ const url = buildUrlWithPost(post); try{ mode==='push' ? history.pushState(history.state||{hdm:null}, document.title, url) : history.replaceState(history.state||{hdm:null}, document.title, url); }catch(_){} } /* ---------- State ---------- */ let currentMemberId = null; let lastPics = []; let galleryLoadedOnce = false; let bootOpenedFromPost = false; let suppressReopenOnce = false; let needRefreshOnOpen = false; let _hdmClosing = false; // Jump-Guard fürs Zurück-Swipen /* ---------- Like-Shadow & Pending (FIX gegen -1) ---------- */ const likeShadow = new Map(); const likePending = new Map(); // id -> true/false function setLikePending(id, v){ likePending.set(String(id), !!v); } function isLikePending(id){ return likePending.get(String(id)) === true; } function setHeartVisualBox(likeEl, liked){ const path = likeEl?.querySelector('.heart-outline path'); if (!path) return; path.setAttribute('fill', liked ? '#ff3939' : 'none'); path.setAttribute('stroke', liked ? '#ff3939' : '#d77f47'); } function setDetailHeartVisual(btn, liked){ const path = btn?.querySelector('.heart-outline path'); if (!path) return; path.setAttribute('fill', liked ? '#ff3939' : 'none'); path.setAttribute('stroke', liked ? '#ff3939' : 'var(--clr-primary)'); } function applyLikeShadow(cardEl, pictureId){ const sh = likeShadow.get(String(pictureId)); if (!sh) return; const likeEl = cardEl.querySelector('.hdm-likes'); if (!likeEl) return; // Herz-Zustand likeEl.classList.toggle('liked', !!sh.liked); setHeartVisualBox(likeEl, !!sh.liked); // Zahl NUR überschreiben, wenn eine gültige Zahl im Shadow ist if (typeof sh.likes === 'number'){ const num = likeEl.querySelector('.hdm-like-num') || likeEl.querySelector('span:last-child'); if (num) num.textContent = String(clampLikes(sh.likes)); } } // Erzwingt, dass eine sichtbare Zahl im Like-Button steht – immer! function forceLikeNumber(likeEl, pic){ if (!likeEl) return; // Ziel-Span holen/erzeugen let n = likeEl.querySelector('.hdm-like-num'); if (!n){ n = document.createElement('span'); n.className = 'hdm-like-num'; likeEl.appendChild(n); } // Quelle bestimmen: Shadow (live), sonst Pic, sonst 0 const sh = likeShadow.get(String(pic?.id ?? likeEl?.dataset?.id ?? '')); const val = (sh && typeof sh.likes === 'number') ? sh.likes : getLikes(pic || {}); n.textContent = String(clampLikes(val)); } /* --- NEW: Mitglied sicherstellen + RPC mit Rückgabewert nutzen --- */ async function ensureMemberId(){ if (currentMemberId) return currentMemberId; const m = await getMemberNormalized(); currentMemberId = m?.id || null; return currentMemberId; } async function rpcToggleLike(bildId){ const uid = await ensureMemberId(); if (!uid) { showDoggoSnackbar('Bitte einloggen, um zu liken.'); throw new Error('NO_LOGIN'); } const { data, error } = await window.supabase .rpc('toggle_like_hund_des_monats', { p_bild_id: bildId, p_memberstack_id: uid }); if (error) throw error; const row = (Array.isArray(data) ? data[0] : data) || {}; // likes robust normalisieren (nimmt likes | likes_count | like_count | likeTotal | total_likes) const likes = clampLikes( row.likes ?? row.likes_count ?? row.like_count ?? row.likeTotal ?? row.total_likes ?? 0 ); // liked_now robust normalisieren (nimmt liked_now | liked | user_liked | has_liked) const liked_now = !!(row.liked_now ?? row.liked ?? row.user_liked ?? row.has_liked ?? false); return { liked_now, likes }; } function applyLikeResultToCard(likeEl, result){ if (!likeEl) return; likeEl.classList.toggle('liked', !!result.liked_now); const numEl = likeEl.querySelector('.hdm-like-num') || likeEl.querySelector('.like-number') || likeEl.querySelector('span:last-child'); if (numEl) numEl.textContent = String(clampLikes(result.likes)); setHeartVisualBox(likeEl, !!result.liked_now); } /* ---------- Kommentar-Report Helper ---------- */ const reportLock = new Map(); function unlockReport(type, id){ const key = ${type}:${id}; const entry = reportLock.get(key); if (!entry) return; clearTimeout(entry.tid); if (entry.btn){ entry.btn.disabled=false; entry.btn.removeAttribute('aria-disabled'); entry.btn.style.opacity=''; } reportLock.delete(key); } function guardedReport(type, id, btn){ const key = ${type}:${id}; if (reportLock.has(key)) { showDoggoSnackbar('Schon gemeldet – wir prüfen das.'); return; } if (btn){ btn.disabled=true; btn.setAttribute('aria-disabled','true'); btn.style.opacity='0.6'; } const tid = setTimeout(() => unlockReport(type, id), 20000); reportLock.set(key, { tid, btn }); try{ if (typeof openReportDialog === 'function') openReportDialog(type, id); else { showDoggoSnackbar('Melden-Funktion derzeit nicht verfügbar.'); unlockReport(type, id); } }catch(err){ console.error('[report]', err); unlockReport(type, id); } } window.addEventListener('doggomeal:report:done', (e) => { const { type, id } = (e && e.detail) || {}; if (type && id) unlockReport(type, id); }); /* ---------- Suche Bild per ID/URL ---------- */ function findPicByUrlOrId(idOrUrl){ if (!lastPics.length) return null; const needle = String(idOrUrl||'').trim(); if (!needle) return null; if (!isUrlish(needle)){ const byId = lastPics.find(p => String(p.id) === needle); if (byId) return byId; } const norm = normalizeUrl(needle); const exact = lastPics.find(p => normalizeUrl(p.bild_url) === norm); if (exact) return exact; return lastPics.find(p => normalizeUrl(p.bild_url).startsWith(norm)); } /* ---------- HDM: Einzel-Post anreichern ---------- */ async function hydrateHdmPic(rawPic){ const sb = window.supabase; if (!sb || !rawPic || !rawPic.id) return rawPic; const uid = await ensureMemberId(); // 1) Likes + liked IMMER über den definer-RPC holen (umgeht RLS) ✅ let merged = { ...rawPic }; try{ const { data, error } = await sb.rpc('get_hund_des_monats_with_likes', { p_memberstack_id: uid || '' // leerer String = "nicht geliked" }); if (error) throw error; const fresh = Array.isArray(data) ? data.find(x => String(x.id) === String(rawPic.id)) : null; if (fresh){ // RPC-Werte sind Quelle der Wahrheit merged = normalizePic({ ...rawPic, ...fresh }); }else{ merged = normalizePic(merged); } }catch(e){ console.warn('[hydrateHdmPic rpc]', e); merged = normalizePic(merged); } // 2) Owner-Metadaten ergänzen (optional, unverändert wie zuvor) try{ const needsAvatar = !merged.profilbild; const needsName = !merged.hundename; const mid = merged.memberstack_id || merged.user_id; if ((needsAvatar || needsName) && mid){ const [mediaRes, publicRes] = await Promise.all([ sb.from('doggo_profile_media').select('avatar_url').eq('memberstack_id', mid).maybeSingle(), sb.from('doggo_public_profile').select('hundename').eq('memberstack_id', mid).maybeSingle() ]); if (needsAvatar && mediaRes?.data?.avatar_url) merged.profilbild = mediaRes.data.avatar_url; if (needsName && publicRes?.data?.hundename) merged.hundename = publicRes.data.hundename; } }catch(e){ console.warn('[hydrateHdmPic ownerMeta]', e); } return merged; } /* ---------- Öffnen/Schließen ---------- */ async function ensureGalleryOpen(){ const overlay = document.getElementById('hdm-overlay'); if (!overlay.classList.contains('hdm-overlay-active')){ overlay.classList.add('hdm-overlay-active'); overlay.style.display='block'; lockScroll(); try{ history.pushState({hdm:'gallery'}, document.title); }catch{} } if (!galleryLoadedOnce) await loadGallery(); } function openGalleryOverlay(){ const overlay = document.getElementById('hdm-overlay'); if (!overlay.classList.contains('hdm-overlay-active')){ overlay.classList.add('hdm-overlay-active'); overlay.style.display='block'; lockScroll(); } const st = history.state && history.state.hdm; if (st!=='gallery' && st!=='detail'){ try{ history.pushState({hdm:'gallery'}, document.title); }catch{} } updateUrlPost(null,'replace'); if (!galleryLoadedOnce || needRefreshOnOpen){ loadGallery().then(()=>{ needRefreshOnOpen=false; }); } } /* NEW: sofort sichtbares Detail-Skeleton (gegen Flash) */ function showDetailSkeleton(){ const detail = document.getElementById('hdm-detail-overlay'); const sk = document.getElementById('hdm-detail-skeleton'); try{ lockScroll(); detail.style.display='flex'; if (sk) sk.style.display = 'flex'; // ← sichtbar lassen bis Bild wirklich lädt document.getElementById('dgm-prehide')?.remove(); document.getElementById('hdm-profile-img').src = 'https://i.imgur.com/ZcLLrkY.png'; document.getElementById('hdm-profile-username').textContent = 'lädt…'; }finally{ document.getElementById('dgm-prehide')?.remove(); } } async function openDetailOverlay(pic, opts={updateUrl:true}){ try{ const detail = document.getElementById('hdm-detail-overlay'); const sk = document.getElementById('hdm-detail-skeleton'); // 1) Sofort normalisieren & anzeigen (ohne zu warten) detail.style.display = 'flex'; /* 🔎 Robust prüfen, ob wir hydratisieren müssen */ const HAS = (o,k)=>Object.prototype.hasOwnProperty.call(o||{},k); const likeCountNow = _normLikes(pic); const likesProvided = hasReliableLikeCount(pic); // ← nutzt den neuen Helper const likedProvided = HAS(pic,'liked') || HAS(pic,'liked_by_me') || HAS(pic,'user_liked') || HAS(pic,'has_liked'); const ownerProvided = !!(pic?.profilbild) || !!(pic?.hundename); // Inkonsistent: liked==true, aber Like-Zahl < 1 ⇒ zwingend hydratisieren const inconsistentLiked = (pic?.liked === true && likeCountNow < 1); /* 👉 Wenn etwas fehlt oder inkonsistent ist: EINMAL hydratisieren */ const shouldHydrate = !pic._trusted && (!likesProvided || !likedProvided || !ownerProvided || inconsistentLiked); if (shouldHydrate) { try { const fresh = await hydrateHdmPic(pic); showDetailView(normalizePic(fresh)); } catch(e){ console.warn('[openDetailOverlay hydrate]', e); showDetailView(normalizePic(pic)); } } else { showDetailView(normalizePic(pic)); } // 2) URL/History aktualisieren try{ const postKey = (pic?.id != null) ? String(pic.id) : (pic?.bild_url || ''); const url = opts.updateUrl ? buildUrlWithPost(postKey) : undefined; history.pushState({ hdm:'detail', id: pic.id, deep:true }, document.title, url || undefined); }catch{ try{ history.pushState({ hdm:'detail', id: pic.id, deep:true }, document.title); }catch{} } }catch(err){ console.error('[openDetailOverlay]', err); showDoggoSnackbar('❌ Konnte den Beitrag nicht öffnen.'); } } function backFromDetail(){ const overlay = document.getElementById('hdm-overlay'); const detail = document.getElementById('hdm-detail-overlay'); if (detail) detail.style.display='none'; if (overlay && !overlay.classList.contains('hdm-overlay-active')){ overlay.classList.add('hdm-overlay-active'); overlay.style.display='block'; } try{ const url = buildUrlWithPost(null); history.replaceState({ hdm:'gallery' }, document.title, url); }catch{} } function smartBackFromDetail(){ if (_hdmClosing) return; // Jump-Guard _hdmClosing = true; setTimeout(()=>{ _hdmClosing = false; }, 600); const overlayActive = document.getElementById('hdm-overlay')?.classList.contains('hdm-overlay-active'); const detail = document.getElementById('hdm-detail-overlay'); if (overlayActive){ backFromDetail(); }else{ if (detail) detail.style.display='none'; unlockScroll(); try{ history.back(); }catch{ location.href = APP_HOME; } } } function closeAllHdmOverlays(){ suppressReopenOnce = true; setTimeout(()=>suppressReopenOnce=false, 600); const overlay = document.getElementById('hdm-overlay'); const detail = document.getElementById('hdm-detail-overlay'); if (detail) detail.style.display='none'; if (overlay){ overlay.classList.remove('hdm-overlay-active'); overlay.style.display='none'; } unlockScroll(); updateUrlPost(null,'replace'); needRefreshOnOpen = true; } /* === HDM Deep-Link API ========================== */ window.DGM_HDM = window.DGM_HDM || {}; window.DGM_HDM.openByPost = async function(idOrUrl){ try{ const key = String(idOrUrl||'').trim(); if(!key) return; const inMemory = findPicByUrlOrId(key); if (inMemory) { const pic = (typeof inMemory.likes==='number' && typeof inMemory.liked==='boolean' && inMemory.profilbild && inMemory.hundename) ? inMemory : await hydrateHdmPic(inMemory); await openDetailOverlay(pic, {updateUrl:true}); return; } const sb = window.supabase; if(!sb) return; let pic = null; let rId = await sb.from('hund_des_monats').select('*').eq('id', key).maybeSingle(); pic = rId?.data || null; if (!pic) { const norm = normalizeUrl(key); let r = await sb.from('hund_des_monats').select('*').eq('bild_url', norm).maybeSingle(); pic = r.data || null; if (!pic) { const tail = norm.split('/').pop() || norm; const r2 = await sb.from('hund_des_monats').select('*').like('bild_url', %${tail}%).limit(1); pic = (r2.data && r2.data[0]) || null; } } if (!pic) { showDoggoSnackbar('Beitrag nicht gefunden.'); return; } pic = await hydrateHdmPic(pic); await openDetailOverlay(pic, {updateUrl:true}); }catch(err){ console.warn('[HDM openByPost]', err); } }; window.DGM_HDM.closeAll = closeAllHdmOverlays; window.DGM_HDM.isOpen = function(){ const o = document.getElementById('hdm-overlay'); const d = document.getElementById('hdm-detail-overlay'); return (!!o && o.classList.contains('hdm-overlay-active')) || (!!d && d.style.display === 'flex'); }; window.addEventListener('doggomeal:tabchange', () => { if (window.DGM_HDM?.isOpen()) closeAllHdmOverlays(); }); /* ---------- Edge Swipe ---------- */ function attachEdgeSwipe(overlayEl, onDismiss, scrollSelector){ if (!overlayEl) return; const panel = overlayEl.querySelector(scrollSelector) || overlayEl; panel.style.willChange = 'transform'; // ← flüssiger beim Verschieben let tracking=false, startX=0, startY=0, moved=false; overlayEl.addEventListener('pointerdown', (e)=>{ if (e.clientX > 24) return; tracking=true; moved=false; startX=e.clientX; startY=e.clientY; panel.style.transition='none'; panel.setPointerCapture?.(e.pointerId); }); overlayEl.addEventListener('pointermove', (e)=>{ if (!tracking) return; const dx = e.clientX - startX; const dy = Math.abs(e.clientY - startY); if (dy > 12 && Math.abs(dx) < 8) return; if (dx < 0){ panel.style.transform = translateX(${dx*0.2}px); moved=true; return; } e.preventDefault(); moved=true; panel.style.transform = translateX(${dx}px); }, {passive:false}); function endPointer(e){ if (!tracking) return; tracking=false; panel.releasePointerCapture?.(e.pointerId); panel.style.transition='transform .22s ease'; const dx = e.clientX - startX; if (moved && dx > 70){ panel.style.transform='translateX(100%)'; setTimeout(()=>{ panel.style.transform=''; onDismiss(); }, 180); } else panel.style.transform=''; } overlayEl.addEventListener('pointerup', endPointer); overlayEl.addEventListener('pointercancel', endPointer); } /* ---------- Galerie ---------- */ async function loadGallery(){ const supabase = window.supabase; const member = await getMemberNormalized(); const grid = document.getElementById('hdm-grid'); grid.innerHTML = ''; if (!member.id){ grid.innerHTML = '<div style="text-align:center;width:100%;opacity:.7">Bitte einloggen, um die Galerie zu sehen.</div>'; galleryLoadedOnce = true; lastPics = []; return []; } currentMemberId = member.id; const { data:pics, error } = await supabase.rpc('get_hund_des_monats_with_likes', { p_memberstack_id: member.id }); if (error){ console.error('[RPC:get_hund_des_monats_with_likes]', error); grid.innerHTML = '<div style="color:#c00;text-align:center">Fehler beim Laden</div>'; galleryLoadedOnce = true; lastPics = []; return []; } lastPics = Array.isArray(pics) ? pics : []; // SOFORT alle Einträge vereinheitlichen -> p.likes / p.liked sind gesetzt lastPics = lastPics.map(normalizePic); // ⬇️ NEU: Sortierung – erst nach Likes (DESC), dann nach Datum (neueste zuerst) const getDate = p => new Date(p.created_at || p.erstellt_am || 0); lastPics.sort((a, b) => (b.likes - a.likes) || (getDate(b) - getDate(a))); galleryLoadedOnce = true; if (!lastPics.length){ grid.innerHTML = '<div style="text-align:center;width:100%;opacity:.5">Noch kein Bild hochgeladen.</div>'; return lastPics; } // === Virtualisierte Batches ========================= const PAGE = 20; let cursor = 0; function makeCard(p){ const card = document.createElement('div'); card.className = 'hdm-card'; card.innerHTML = <img src="${p.bild_url}" alt="${p.hundename}"> <div class="hdm-name-like-row"> <div class="hdm-dogname">${p.hundename}</div> <div class="hdm-likes${p.liked ? ' liked' : ''}" data-id="${p.id}" role="button" tabindex="0" aria-label="Gefällt mir"> <span class="heart"> <svg class="heart-outline" viewBox="0 0 24 24" width="23" height="23"> <path d="M12 21c-.6 0-1.2-.21-1.65-.62C6.05 17.17 2 13.39 2 9.5 2 6.42 4.42 4 7.5 4c1.74 0 3.41.81 4.5 2.09C13.09 4.81 14.76 4 16.5 4 19.58 4 22 6.42 22 9.5c0 3.89-4.05 7.67-8.35 10.88-.45.41-1.05.62-1.65.62z" fill="${p.liked ? '#ff3939' : 'none'}" stroke="${p.liked ? '#ff3939' : '#d77f47'}" stroke-width="2.1"/> </svg> </span> <span class="hdm-like-num">${getLikes(p)}</span> </div> </div> ; const imgEl = card.querySelector('img'); wireImgFallback(imgEl); const likeBox = card.querySelector('.hdm-likes'); forceLikeNumber(likeBox, p); setHeartVisualBox(likeBox, !!p.liked); applyLikeShadow(card, p.id); // Doppeltap/Dblclick = Like let lastTap = 0; imgEl.addEventListener('touchend', function(e){ const now = Date.now(); if (now - lastTap < 350){ e.preventDefault(); likeBox.click(); } lastTap = now; }, { passive:false }); imgEl.addEventListener('dblclick', function(e){ e.preventDefault(); likeBox.click(); }); // Like-Handler likeBox.onclick = async (e)=>{ e.stopPropagation(); if (isLikePending(p.id)) return; setLikePending(p.id, true); const wasLiked = likeBox.classList.contains('liked'); const numEl = likeBox.querySelector('.hdm-like-num') || likeBox.querySelector('span:last-child'); const prev = clampLikes(numEl && numEl.textContent ? numEl.textContent : '0'); const optimisticLiked = !wasLiked; const optimisticCount = optimisticLiked ? prev + 1 : clampLikes(prev - 1); likeBox.classList.toggle('liked', optimisticLiked); numEl.textContent = String(optimisticCount); setHeartVisualBox(likeBox, optimisticLiked); try{ const res = await rpcToggleLike(p.id); applyLikeResultToCard(likeBox, res); likeShadow.set(String(p.id), { liked: res.liked_now, likes: res.likes }); }catch(err){ console.error('[toggle like]', err); showDoggoSnackbar('❌ Liken fehlgeschlagen'); likeBox.classList.toggle('liked', wasLiked); numEl.textContent = String(prev); setHeartVisualBox(likeBox, wasLiked); likeShadow.delete(String(p.id)); }finally{ setLikePending(p.id, false); } }; // Öffnen p._trusted = true; imgEl.onclick = () => openDetailOverlay(p, {updateUrl:true}); return card; } function appendNextPage(){ const slice = lastPics.slice(cursor, cursor + PAGE); slice.forEach(p => grid.appendChild(makeCard(p))); cursor += slice.length; if (cursor >= lastPics.length) { if (sentinel && sentinel.parentNode) sentinel.parentNode.removeChild(sentinel); io.disconnect(); } } const sentinel = document.createElement('div'); sentinel.id = 'hdm-sentinel'; sentinel.style.cssText='height:1px;width:100%'; grid.appendChild(sentinel); const io = new IntersectionObserver((entries)=>{ entries.forEach(e=>{ if(e.isIntersecting){ appendNextPage(); } }); }, { root: document.querySelector('.hdm-overlay-scroll'), rootMargin:'600px 0px', threshold:0 }); io.observe(sentinel); // Erste Seite sofort appendNextPage(); tryOpenFromPostParam(); return lastPics; } /* ---------- Detail ---------- */ function showDetailView(pic){ if (!pic || typeof pic!=='object'){ showDoggoSnackbar('Fehler: Bilddaten fehlen!'); return; } // Immer oben starten – NACHDEM das Overlay sichtbar ist requestAnimationFrame(() => { const scroller = document.querySelector('#hdm-detail-overlay .hdm-detail-scroll'); if (scroller) { const prev = scroller.style.scrollBehavior; scroller.style.scrollBehavior = 'auto'; scroller.scrollTop = 0; scroller.style.scrollBehavior = prev || ''; } const detailOverlayEl = document.getElementById('hdm-detail-overlay'); if (detailOverlayEl) detailOverlayEl.scrollTop = 0; }); const profilbild = pic.profilbild || 'https://i.imgur.com/ZcLLrkY.png'; const hundename = pic.hundename || 'Doggo'; const bildUrl = pic.bild_url || ''; let caption = typeof pic.caption==='string' ? pic.caption : ''; const memberstackId= pic.memberstack_id || pic.user_id || ''; const likes = getLikes(pic); const liked = !!pic.liked; const pimg = document.getElementById('hdm-profile-img'); pimg.src = profilbild; wireImgFallback(pimg); document.getElementById('hdm-profile-username').textContent = hundename; const detailImg = document.getElementById('hdm-detail-img'); detailImg.src = bildUrl; wireImgFallback(detailImg); const sk = document.getElementById('hdm-detail-skeleton'); detailImg.onload = ()=>{ if(sk) sk.style.display = 'none'; }; detailImg.onerror = ()=>{ if(sk) sk.style.display = 'none'; }; // Profilzeile klickbar -> /user document.getElementById('hdm-profile-link').onclick = ()=>{ if (!memberstackId) return; closeAllHdmOverlays(); setTimeout(()=>{ location.href = /user?uid=${encodeURIComponent(memberstackId)}; }, 10); }; // Close im Detail document.getElementById('hdm-detail-close').onclick = (e) => { e.stopPropagation(); const ml = document.getElementById('hdm-detail-menu-list'); if (ml) ml.style.display = 'none'; smartBackFromDetail(); }; // Like-Button (mit Shadow + Pending) const likeBtn = document.getElementById('hdm-detail-likebtn'); const shadow = likeShadow.get(String(pic.id)); const effLiked = (shadow && typeof shadow.liked==='boolean') ? shadow.liked : liked; const effLikes = clampLikes((shadow && typeof shadow.likes==='number') ? shadow.likes : likes); likeBtn.classList.toggle('liked', effLiked); likeBtn.innerHTML = <svg class="heart-outline" viewBox="0 0 24 24" width="25" height="25"> <path d="M12 21c-.6 0-1.2-.21-1.65-.62C6.05 17.17 2 13.39 2 9.5 2 6.42 4.42 4 7.5 4 c1.74 0 3.41.81 4.5 2.09C13.09 4.81 14.76 4 16.5 4 19.58 4 22 6.42 22 9.5c0 3.89-4.05 7.67-8.35 10.88-.45.41-1.05.62-1.65.62z" fill="${effLiked ? '#ff3939' : 'none'}" stroke="${effLiked ? '#ff3939' : 'var(--clr-primary)'}" stroke-width="2.1"/> </svg> <span class="like-number">${effLikes}</span> ; setDetailHeartVisual(likeBtn, effLiked); function triggerLikeBurst(){ const box = document.querySelector('.hdm-detail-imgbox'); if (!box) return; const burst = document.createElement('div'); burst.className = 'hdm-like-burst'; burst.innerHTML = <svg viewBox="0 0 24 24"> <path d="M12 21c-.6 0-1.2-.21-1.65-.62C6.05 17.17 2 13.39 2 9.5 2 6.42 4.42 4 7.5 4c1.74 0 3.41.81 4.5 2.09C13.09 4.81 14.76 4 16.5 4 19.58 4 22 6.42 22 9.5c0 3.89-4.05 7.67-8.35 10.88-.45.41-1.05.62-1.65.62z" fill="#ff3939" stroke="#ff3939" stroke-width="1.4"/> </svg>; box.appendChild(burst); burst.addEventListener('animationend', () => burst.remove()); } /* --- NEW: Double-Tap Burst + serverseitiges Ergebnis --- */ async function likeIfNeededAndAnimate(){ if (isLikePending(pic.id)) return; if (!likeBtn.classList.contains('liked')){ setLikePending(pic.id, true); // Optimistisch +1 let cur = clampLikes(likeBtn.querySelector('.like-number')?.textContent || '0'); likeBtn.classList.add('liked'); likeBtn.querySelector('.like-number').textContent = String(cur + 1); setDetailHeartVisual(likeBtn, true); try{ const res = await rpcToggleLike(pic.id); likeBtn.classList.toggle('liked', res.liked_now); likeBtn.querySelector('.like-number').textContent = String(res.likes); setDetailHeartVisual(likeBtn, res.liked_now); likeShadow.set(String(pic.id), { liked: res.liked_now, likes: res.likes }); const cardLike = document.querySelector(.hdm-likes[data-id="${pic.id}"]); if (cardLike) applyLikeResultToCard(cardLike, res); }catch(err){ console.error(err); showDoggoSnackbar('❌ Liken fehlgeschlagen'); }finally{ setLikePending(pic.id, false); } } triggerLikeBurst(); } /* --- NEW: Haupt-Click auf das Herz mit serverseitigem Ergebnis --- */ likeBtn.onclick = async ()=>{ if (isLikePending(pic.id)) return; setLikePending(pic.id, true); // Optimistisch const wasLiked = likeBtn.classList.contains('liked'); const numEl = likeBtn.querySelector('.like-number'); const prev = clampLikes(numEl?.textContent || '0'); const optimistic = !wasLiked ? prev + 1 : clampLikes(prev - 1); likeBtn.classList.toggle('liked', !wasLiked); numEl.textContent = String(optimistic); setDetailHeartVisual(likeBtn, !wasLiked); try{ const res = await rpcToggleLike(pic.id); likeBtn.classList.toggle('liked', res.liked_now); numEl.textContent = String(res.likes); setDetailHeartVisual(likeBtn, res.liked_now); likeShadow.set(String(pic.id), { liked: res.liked_now, likes: res.likes }); // sichtbare Galerie-Karte live aktualisieren const likeBox = document.querySelector(.hdm-likes[data-id="${pic.id}"]); if (likeBox) applyLikeResultToCard(likeBox, res); }catch(err){ console.error(err); showDoggoSnackbar('❌ Liken fehlgeschlagen'); // Revert likeBtn.classList.toggle('liked', wasLiked); numEl.textContent = String(prev); setDetailHeartVisual(likeBtn, wasLiked); likeShadow.delete(String(pic.id)); }finally{ setLikePending(pic.id, false); } }; // Double-Tap / Dblclick auf Bild let lastTapDetail = 0; detailImg.ontouchend = function(e){ const now=Date.now(); if (now - lastTapDetail < 350){ e.preventDefault(); likeIfNeededAndAnimate(); } lastTapDetail = now; }; detailImg.ondblclick = function(e){ e.preventDefault(); likeIfNeededAndAnimate(); }; // Menü (bearbeiten/löschen/melden) const menuBtn = document.getElementById('hdm-detail-menu-btn'); const menuList = document.getElementById('hdm-detail-menu-list'); menuList.innerHTML = ''; if ((pic.memberstack_id || pic.user_id) === currentMemberId){ const editBtn = document.createElement('button'); editBtn.textContent = caption.trim() ? 'Beschreibung bearbeiten' : 'Beschreibung hinzufügen'; editBtn.onclick = () => editCaption(pic); const delBtn = document.createElement('button'); delBtn.textContent = 'Beitrag löschen'; delBtn.onclick = async () => { if (!confirm('Beitrag wirklich löschen?')) return; const { error } = await window.supabase.rpc('delete_hund_des_monats', { p_bild_id:pic.id, p_memberstack_id: currentMemberId }); if (error){ showDoggoSnackbar('❌ Löschen fehlgeschlagen'); return; } menuList.style.display='none'; closeAllHdmOverlays(); showDoggoSnackbar('Beitrag gelöscht.'); }; menuList.append(editBtn, delBtn); }else{ const reportBtn = document.createElement('button'); reportBtn.textContent = 'Beitrag melden'; reportBtn.onclick = () => { menuList.style.display='none'; guardedReport('hund_des_monats', pic.id, reportBtn); }; menuList.appendChild(reportBtn); } menuBtn.onclick = (e)=>{ e.stopPropagation(); menuList.style.display = (menuList.style.display==='flex') ? 'none' : 'flex'; }; if (window._hdmMenuOutsideHandler) document.removeEventListener('click', window._hdmMenuOutsideHandler); window._hdmMenuOutsideHandler = (e)=>{ if (!menuList.contains(e.target) && e.target!==menuBtn) menuList.style.display='none'; }; document.addEventListener('click', window._hdmMenuOutsideHandler); // Caption renderCaptionBlock(); function renderCaptionBlock(){ const row = document.getElementById('hdm-detail-caption-row'); row.innerHTML = ''; const username = document.createElement('span'); username.className='hdm-caption-username'; username.textContent=hundename; const wrap = document.createElement('span'); wrap.className='hdm-caption-wrap'; const text = document.createElement('span'); text.className='hdm-caption-text'; text.textContent = caption || ''; wrap.appendChild(text); row.append(username, wrap); if (!caption?.trim()) return; text.classList.add('caption-truncate'); requestAnimationFrame(()=>{ const clamped = text.scrollHeight > text.clientHeight + 1; if (!clamped){ text.classList.remove('caption-truncate'); return; } const t = document.createElement('button'); t.className='caption-more-btn'; t.textContent='mehr'; let expanded=false; t.onclick = (e)=>{ e.stopPropagation(); expanded=!expanded; text.classList.toggle('caption-truncate', !expanded); t.textContent = expanded ? 'weniger' : 'mehr'; }; wrap.appendChild(t); }); } function editCaption(pic){ const row = document.getElementById('hdm-detail-caption-row'); row.innerHTML = <textarea id="hdm-caption-input" rows="2" placeholder="Beschreibe das Bild...">${caption||''}</textarea> <button class="caption-save-btn" id="hdm-caption-save">Speichern</button>; document.getElementById('hdm-caption-save').onclick = async ()=>{ const newText = (document.getElementById('hdm-caption-input').value||'').trim(); const { error } = await window.supabase.from('hund_des_monats').update({ caption:newText }).eq('id', pic.id); if (error){ showDoggoSnackbar('❌ Fehler beim Speichern'); return; } showDoggoSnackbar('✅ Beschreibung gespeichert!'); caption = newText; renderCaptionBlock(); loadGallery(); }; } // Kommentare mounten const commentsContainer = document.getElementById('hdm-detail-comments'); commentsContainer.innerHTML = ""; const commentDiv = document.createElement('div'); commentDiv.className = "dgm-comments-box"; commentDiv.dataset.commentsType = "hund_des_monats"; commentDiv.dataset.commentsRefId = pic.id; commentsContainer.appendChild(commentDiv); window.DGMcomments?.init(commentDiv, { type:"hund_des_monats", refId:pic.id }); } /* ---------- Upload ---------- */ async function compressImage(file, { maxW = 1600, maxH = 1600, targetBytes = 600 * 1024, // Ziel ~600 KB (400–600 KB Bereich) qualityMin = 0.5, qualityMax = 0.9, minW = 900, minH = 900, mimePreferred = 'image/webp' } = {}) { // 1) Quelle dekodieren (Fallback für ältere Browser) let src; try { src = await createImageBitmap(file); } catch { src = await new Promise((resolve, reject) => { const url = URL.createObjectURL(file); const img = new Image(); img.onload = () => { URL.revokeObjectURL(url); resolve(img); }; img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); }; img.src = url; }); } // 2) Startgröße const ratio = Math.min(1, maxW / src.width, maxH / src.height); const baseW = Math.max(1, Math.round(src.width * ratio)); const baseH = Math.max(1, Math.round(src.height * ratio)); // Canvas & Helper const canvas = document.createElement('canvas'); function drawToCanvas(w, h) { canvas.width = w; canvas.height = h; const ctx = canvas.getContext('2d', { alpha: false }); // → JPEG ohne Alpha ctx.fillStyle = '#fff'; // weißer BG gegen schwarze Kanten bei PNG→JPEG ctx.fillRect(0, 0, w, h); ctx.drawImage(src, 0, 0, w, h); } async function encode(type, q) { const blob = await new Promise(res => canvas.toBlob(res, type, q)); if (!blob) return null; // Nur echten Typ akzeptieren (kein stiller PNG-Fallback) if (type && blob.type && blob.type !== type) return null; return blob; } // 3) Encoder-Reihenfolge (echte WebP-Unterstützung prüfen) const supportsWebP = (() => { try { return canvas.toDataURL('image/webp').startsWith('data:image/webp'); } catch { return false; } })(); const encoders = []; if (mimePreferred === 'image/webp' && supportsWebP) encoders.push('image/webp'); encoders.push('image/jpeg'); // Fallback immer vorhanden const changeExt = (name, type) => { const ext = type === 'image/webp' ? '.webp' : '.jpg'; return name.replace(/\.(heic|heif|png|jpe?g|webp|avif)$/i, '') + ext; }; // 4) Qualität via Binärsuche, notfalls Abmessungen reduzieren drawToCanvas(baseW, baseH); for (const type of encoders) { // a) Binärsuche bei fester Größe let lo = qualityMin, hi = qualityMax, best = null; for (let i = 0; i < 8; i++) { const q = (lo + hi) / 2; const b = await encode(type, q); if (!b) { best = null; break; } // Encoder nicht unterstützt if (b.size <= targetBytes) { best = b; lo = q; } else { hi = q; } } if (best) return new File([best], changeExt(file.name, type), { type }); // b) Wenn selbst bei min-Qualität zu groß → schrittweise verkleinern let w = baseW, h = baseH; for (let step = 0; step < 6 && (w > minW || h > minH); step++) { w = Math.max(minW, Math.round(w * 0.85)); h = Math.max(minH, Math.round(h * 0.85)); drawToCanvas(w, h); let lo2 = qualityMin, hi2 = qualityMax, best2 = null; for (let j = 0; j < 6; j++) { const q = (lo2 + hi2) / 2; const b = await encode(type, q); if (!b) { best2 = null; break; } if (b.size <= targetBytes) { best2 = b; lo2 = q; } else { hi2 = q; } } if (best2) return new File([best2], changeExt(file.name, type), { type }); } // c) Minimaler Versuch: kleinste Größe + min-Qualität, nur wenn sinnvoll kleiner const last = await encode(type, qualityMin); if (last && last.size < file.size * 0.95) { return new File([last], changeExt(file.name, type), { type }); } // Für nächsten Encoder wieder Ausgangsgröße vorbereiten drawToCanvas(baseW, baseH); } // Nichts gewonnen → rufende Stelle nutzt Original return null; } function wireUpload(){ const uploadBtn = document.getElementById('hdm-upload'); const fileInput = document.getElementById('hdm-file'); uploadBtn.onclick = () => fileInput.click(); uploadBtn.addEventListener('touchend', (e)=>{ e.preventDefault(); fileInput.click(); }); fileInput.addEventListener('change', async (e)=>{ const file = e.target.files?.[0]; if (!file) return; // Member laden + Validierungen const member = await getMemberNormalized(); if (!member?.id){ showDoggoSnackbar('Bitte einloggen, bevor du ein Bild hochlädst.'); return; } if (!member?.customFields?.hundename){ showDoggoSnackbar('Bitte trage zuerst den Hundenamen im Profil ein.'); return; } // Komprimieren const compressed = await compressImage(file, { maxW: 1600, maxH: 1600, targetBytes: 600 * 1024, // Zielgröße (anpassbar) mimePreferred: 'image/webp' }); const uploadFile = compressed || file; // Dateiendung passend zum ECHTEN Blob-Typ bestimmen const extFromType = (blob) => blob.type === 'image/webp' ? '.webp' : blob.type === 'image/png' ? '.png' : '.jpg'; const safe = s => s.replace(/[^a-zA-Z0-9._-]/g,'_'); const filenameBase = ${member.id}_${Date.now()}_${safe(file.name)}.replace(/\.(heic|heif|png|jpe?g|webp|avif)$/i, ''); const filename = filenameBase + extFromType(uploadFile); // Upload const up = await window.supabase.storage.from('hund-des-monats').upload(filename, uploadFile, { upsert:true }); if (up?.error){ showDoggoSnackbar('❌ Upload fehlgeschlagen: '+up.error.message); return; } const { data:urlData, error:urlErr } = window.supabase.storage.from('hund-des-monats').getPublicUrl(filename); if (urlErr || !urlData?.publicUrl){ showDoggoSnackbar('❌ Bild-URL konnte nicht abgerufen werden.'); return; } const bildUrl = urlData.publicUrl; const { data, error } = await window.supabase.rpc('upload_hund_des_monats', { p_bild_url: bildUrl, p_hundename: member.customFields.hundename, p_memberstack_id: member.id }); if (error){ showDoggoSnackbar('❌ '+error.message); } else if (data && data[0] && data[0].success===false){ showDoggoSnackbar(data[0].msg); } else { showDoggoSnackbar('✅ Bild erfolgreich hochgeladen!'); await loadGallery(); const pic = findPicByUrlOrId(bildUrl); if (pic) openDetailOverlay(pic, {updateUrl:true}); } e.target.value=''; }); } /* ---------- Deep-Link Boot ---------- */ async function bootOpenFromPostDirect(){ const p = QS().get('post'); if (!p) return; bootOpenedFromPost = true; // WICHTIG: sofort Skeleton zeigen -> keine Sekunde Startscreen showDetailSkeleton(); // Versuche Memory, dann DB: const inMem = findPicByUrlOrId(p); if (inMem){ await openDetailOverlay(inMem, {updateUrl:true}); return; } await window.DGM_HDM.openByPost(p); } function tryOpenFromPostParam(){ if (suppressReopenOnce || bootOpenedFromPost) return; const p = QS().get('post'); if (!p) return; const maybe = findPicByUrlOrId(p); if (maybe){ bootOpenedFromPost = true; showDetailSkeleton(); // sofort sichtbar openDetailOverlay(maybe, {updateUrl:true}); } else { showDetailSkeleton(); // sofort sichtbar während Suche window.DGM_HDM?.openByPost(p); } } /* ---------- Bottom-Nav zuverlässig klickbar ---------- */ (function wireBottomNav(){ const nav = document.querySelector('.bottom-nav, .bottom_nav, [data-bottom-nav]'); if(!nav) return; nav.style.zIndex = '2147483647'; nav.style.pointerEvents = 'auto'; nav.querySelectorAll('a[href]').forEach(a=>{ a.addEventListener('click',(e)=>{ e.preventDefault(); e.stopPropagation(); const href=a.getAttribute('href'); if(!href) return; closeAllHdmOverlays(); setTimeout(()=>{ window.location.href = href; }, 10); }); }); })(); /* ---------- Init ---------- */ whenReady().then(()=>{ try{ const openBtn = document.getElementById('hdm-open'); const overlay = document.getElementById('hdm-overlay'); const backBtn = document.getElementById('hdm-back'); const detailOverlay = document.getElementById('hdm-detail-overlay'); // Member früh laden getMemberNormalized().then(m => { currentMemberId = m.id || null; }); // Info-Modal (function wireInfo(){ const infoBtn = document.getElementById('hdm-info-btn'); const info = document.getElementById('hdm-info-modal'); const panel = info?.querySelector('.hdm-info-modal-content'); const x = document.getElementById('hdm-info-close'); if (!infoBtn || !info || !panel || !x) return; function openInfo(e){ e?.preventDefault(); info.classList.add('active'); lockScroll(); } function closeInfo(e){ e?.stopPropagation?.(); info.classList.remove('active'); unlockScroll(); } // öffnen infoBtn.addEventListener('click', openInfo); // schließen: X x.addEventListener('click', closeInfo); // schließen: Klick auf Backdrop (aber NICHT im Panel) info.addEventListener('click', (e)=>{ if (e.target === info) closeInfo(e); }); // Inhalte dürfen Klicks bubbled NICHT schließen panel.addEventListener('click', (e)=> e.stopPropagation()); // schließen: ESC document.addEventListener('keydown', (e)=>{ if (e.key === 'Escape' && info.classList.contains('active')) closeInfo(e); }); })(); // Buttons openBtn.onclick = (e)=>{ e.preventDefault(); openGalleryOverlay(); }; backBtn.onclick = (e)=>{ e.preventDefault(); if (detailOverlay.style.display==='flex'){ smartBackFromDetail(); } else { closeAllHdmOverlays(); } }; // iOS Touch-Move blocken außerhalb der Scrollcontainer document.body.addEventListener('touchmove', function(e){ if (!document.body.classList.contains('modal-open')) return; if (e.target.closest('.hdm-overlay-scroll, .hdm-detail-scroll, .hdm-info-modal-content')) return; e.preventDefault(); }, { passive:false }); // Edge-Swipe attachEdgeSwipe(overlay, ()=>closeAllHdmOverlays(), '.hdm-overlay-scroll'); attachEdgeSwipe(detailOverlay, ()=>smartBackFromDetail(), '.hdm-detail-scroll'); // History-State (Back-Nav im Browser) if (!history.state){ try{ history.replaceState({hdm:null}, document.title); }catch{} } window.addEventListener('popstate', (e)=>{ const s = e.state || {hdm:null}; if (s.hdm==='detail'){ if (!overlay.classList.contains('hdm-overlay-active')){ lockScroll(); } detailOverlay.style.display='flex'; document.getElementById('dgm-prehide')?.remove(); } else if (s.hdm==='gallery'){ if (!overlay.classList.contains('hdm-overlay-active')){ overlay.classList.add('hdm-overlay-active'); overlay.style.display='block'; lockScroll(); } detailOverlay.style.display='none'; updateUrlPost(null, 'replace'); } else { closeAllHdmOverlays(); } }); wireUpload(); /* NEU: Schwebe-Animation des Upload-Buttons beim Scrollen */ (function wireFabFloat(){ const fab = document.getElementById('hdm-upload'); const scrollers = [ document.querySelector('.hdm-overlay-scroll'), document.querySelector('.hdm-detail-scroll') ].filter(Boolean); if(!fab || !scrollers.length) return; let t; function bump(){ fab.classList.add('is-scrolling'); clearTimeout(t); t = setTimeout(()=>fab.classList.remove('is-scrolling'), 220); } scrollers.forEach(s=> s.addEventListener('scroll', bump, {passive:true})); })(); // Deep-Link sofort & direkt ins Detail (KEIN ensureGalleryOpen) const onRezepte = location.pathname===APP_HOME || location.pathname===APP_HOME+'/'; if (onRezepte && QS().get('post')) { bootOpenFromPostDirect(); } // Sichtbar schalten – aber Prehide NUR entfernen, wenn kein Deeplink document.documentElement.classList.add('dgm-ready'); if (!QS().has('post')) { document.getElementById('dgm-prehide')?.remove(); } }catch(e){ console.error('FEHLER:', e); showDoggoSnackbar('🐶 FATALER SCRIPT-FEHLER: '+(e.message||e)); } }).catch(err=>{ console.error('whenReady() failed:', err); showDoggoSnackbar('🐶 whenReady-Fehler: '+(err.message||err)); }); </script> bitte auch immer wie immer schreiben wo etwas reinsoll, vorher, nachher usw. und hier noch der globale like modul script: <script id="dgm-likes-core"> window.DGMlikes = (function(){ let sb=null, me=null, pending=new Set(); async function init(){ sb = window.supabaseClient || window.supabase; if (!sb) throw new Error('Supabase missing'); try{ const r = await (window.$memberstackDom?.getCurrentMember?.() || {}); const d = r?.data?.member || r?.data || r; me = { id: d?.id || null }; }catch{ me = { id:null }; } } function tableFor(type){ return type==='hdm' ? 'hund_des_monats_likes' : 'post_likes'; } function k(type,id){ return ${type}:${id}; } async function toggle(type, id){ if (!sb) await init(); const key = k(type,id); if (pending.has(key)) return null; pending.add(key); try{ const uid = me?.id; if(!uid) throw new Error('NO_LOGIN'); if (type==='hdm'){ const { data } = await sb.rpc('toggle_like_hund_des_monats',{ p_bild_id:id, p_memberstack_id:uid }); const row = Array.isArray(data) ? data[0] : data || {}; return { likes: +(row.likes ?? row.likes_count ?? 0) || 0, liked: !!(row.liked_now ?? row.liked) }; }else{ const { data: ex } = await sb.from(tableFor(type)) .select('id').eq('ref_id', String(id)).eq('memberstack_id', uid).maybeSingle(); if (ex) await sb.from(tableFor(type)).delete().eq('id', ex.id); else await sb.from(tableFor(type)).insert({ ref_id:String(id), memberstack_id:uid, type }); const [{ count }, { data: u }] = await Promise.all([ sb.from(tableFor(type)).select('*',{count:'exact',head:true}).eq('ref_id', String(id)), sb.from(tableFor(type)).select('id').eq('ref_id', String(id)).eq('memberstack_id', uid).maybeSingle() ]); return { likes: count||0, liked: !!u }; } } finally { pending.delete(key); } } async function get(type, id, viewerId){ if (!sb) await init(); if (type==='hdm'){ const { data } = await sb.rpc('get_hund_des_monats_with_likes', { p_memberstack_id: viewerId || me?.id || '' }); const row = (data||[]).find(r => String(r.id)===String(id)); return { likes: +(row?.likes ?? row?.likes_count ?? 0) || 0, liked: !!(row?.liked ?? row?.liked_by_me) }; }else{ const [{ count }, { data: u }] = await Promise.all([ sb.from(tableFor(type)).select('*',{count:'exact',head:true}).eq('ref_id', String(id)), sb.from(tableFor(type)).select('id').eq('ref_id', String(id)).eq('memberstack_id', viewerId || me?.id || '').maybeSingle() ]); return { likes: count||0, liked: !!u }; } } function renderButton(container, { type, id, initial }){ const btn = document.createElement('button'); btn.className = 'hdm-likes'; btn.dataset.type = type; btn.dataset.id = id; btn.innerHTML = <span class="heart"> <svg class="heart-outline" viewBox="0 0 24 24" width="23" height="23" aria-hidden="true"> <path d="M12 21c-.6 0-1.2-.21-1.65-.62C6.05 17.17 2 13.39 2 9.5 2 6.42 4.42 4 7.5 4c1.74 0 3.41.81 4.5 2.09C13.09 4.81 14.76 4 16.5 4 19.58 4 22 6.42 22 9.5c0 3.89-4.05 7.67-8.35 10.88-.45.41-1.05.62-1.65.62z" stroke="#d77f47" stroke-width="2.1" fill="none"/> </svg> </span> <span class="hdm-like-num">0</span>; const num = btn.querySelector('.hdm-like-num'); function apply(s){ num.textContent = String(Math.max(0, +s.likes||0)); btn.classList.toggle('liked', !!s.liked); const path = btn.querySelector('.heart-outline path'); if (path){ path.setAttribute('fill', s.liked ? '#cc7255' : 'none'); path.setAttribute('stroke', s.liked ? '#cc7255' : '#d77f47'); } } apply(initial||{likes:0, liked:false}); btn.addEventListener('click', async (e)=>{ e.stopPropagation(); const prev = { likes:+num.textContent||0, liked:btn.classList.contains('liked') }; apply({ likes: prev.liked? Math.max(0, prev.likes-1): prev.likes+1, liked: !prev.liked }); // optimistisch try{ apply(await toggle(type, id) || prev); }catch{ apply(prev); } }); container.appendChild(btn); if (!initial){ get(type, id).then(apply).catch(()=>{}); } return btn; } return { init, toggle, get, renderButton }; })(); </script>
+
+
+<script>
+(async function(){ try{
+  // ===== helpers, die dein Code unten erwartet =====
+const APP_HOME = '/rezepte';
+const $  = (s,r=document)=>r.querySelector(s);
+const $$ = (s,r=document)=>Array.from(r.querySelectorAll(s));
+
+/** Warten bis Objekte da sind (robust, ~12s Timeout) */
+function waitFor(check, { tries = 240, delay = 50 } = {}) {
+  return new Promise(res => {
+    let n = 0;
+    (function loop(){
+      const v = check();
+      if (v !== null && v !== undefined) return res(v);
+      if (++n >= tries) return res(null);
+      setTimeout(loop, delay);
+    })();
+  });
+}
+
+/** Memberstack v1/v2 sicher greifen (DOM/$memberstackDom) */
+async function getMS(){
+  return await waitFor(() => {
+    const ms1 = window.$memberstackDom;
+    const ms2 = window.Memberstack?.DOM || window.Memberstack;
+    const ms  = ms1 || ms2 || null;
+    if (!ms) return null;
+    // nur „echte“ Instanzen zurückgeben
+    if (ms.getCurrentMember || ms?.memberstack?.getCurrentMember) return ms;
+    return null;
+  }, { tries: 240, delay: 50 });
+}
+
+/** Supabase-CLIENT sicherstellen (existierend nutzen oder neu bauen) */
+async function getSB(){
+  return await waitFor(() => {
+    // a) bereits erzeugter Client?
+    const ready = window.supabaseClient || window._supabase || window.SUPABASE || window.sb || null;
+    if (ready?.from && ready?.storage) return ready;
+
+    // b) manchmal liegt der Client direkt unter window.supabase
+    if (window.supabase?.from && window.supabase?.storage) return window.supabase;
+
+    // c) sonst aus Namespace bauen (URL/Key aus Meta, data-Attr oder globalen Variablen)
+    const ns  = window.supabase;
+    const metaUrl = document.querySelector('meta[name="supabase-url"]')?.content;
+    const metaKey = document.querySelector('meta[name="supabase-key"]')?.content;
+    const dsEl    = document.querySelector('[data-sb-url][data-sb-key]') || document.body;
+    const url = window.SUPABASE_URL || dsEl?.dataset?.sbUrl || metaUrl || null;
+    const key = window.SUPABASE_ANON_KEY || dsEl?.dataset?.sbKey || metaKey || null;
+
+    if (ns?.createClient && url && key){
+      try{
+        const client = ns.createClient(url, key);
+        window.supabaseClient = client; // einheitlich global ablegen
+        return client;
+      }catch(e){ console.warn('[SB] createClient failed', e); }
+    }
+    return null;
+  }, { tries: 240, delay: 50 });
+}
+
+/** Normalisierte Member-Daten (funktioniert mit MS v1/v2) */
+async function getMemberNormalized(ms){
+  try{
+    const getter = ms?.getCurrentMember || ms?.memberstack?.getCurrentMember;
+    const res    = getter ? await getter() : null;
+    const data   = res?.data || res || {};
+    const member = data.member || data || {};
+    return {
+      id: member.id || data.id || null,
+      cf: member.customFields || data.customFields || {}
+    };
+  }catch(err){
+    console.warn('[MS] getMemberNormalized failed', err);
+    return { id:null, cf:{} };
+  }
+}
+
+
+  // NEU: Bild-Fallback (gegen weiße Kacheln)
+  function wireImgFallback(img){
+    if(!img) return; img.loading = 'lazy'; img.decoding='async';
+    let retried=false;
+    img.onerror=()=>{
+      if(retried){ img.src='https://via.placeholder.com/900x900.png?text=Doggo'; return; }
+      retried=true;
+      try{ const u=new URL(img.src, location.origin); u.searchParams.set('v', Date.now()); img.src=u.toString(); }
+      catch(_){ img.src = img.src + ((img.src||'').includes('?')?'&':'?') + 'v='+Date.now(); }
+    };
+  }
+
+  // NEU: kleine Cache-Helfer (Profil-Posts)
+  const CACHE_TTL_MS = 90*1000;
+  function cacheKey(uid){ return `DM_POSTS_CACHE:${uid}`; }
+  function getCachedPosts(uid){
+    try{
+      const raw=sessionStorage.getItem(cacheKey(uid)); if(!raw) return null;
+      const {ts,items}=JSON.parse(raw); if(!Array.isArray(items)) return null;
+      if(Date.now()-ts > CACHE_TTL_MS) return null;
+      return items;
+    }catch(_){ return null; }
+  }
+  function setCachedPosts(uid, items){
+    try{ sessionStorage.setItem(cacheKey(uid), JSON.stringify({ts:Date.now(), items:items||[]})); }catch(_){}
+  }
+  // NEU: Cache-Helfer (Profil-Galerie)
+const GALLERY_CACHE_TTL_MS = 90*1000;
+function galleryKey(uid){ return `DM_GALLERY_CACHE:${uid}`; }
+function getCachedGallery(uid){
+  try{
+    const raw = sessionStorage.getItem(galleryKey(uid));
+    if(!raw) return null;
+    const { ts, items } = JSON.parse(raw);
+    if(!Array.isArray(items)) return null;
+    if(Date.now() - ts > GALLERY_CACHE_TTL_MS) return null;
+    return items;
+  }catch(_){ return null; }
+}
+function setCachedGallery(uid, items){
+  try{ sessionStorage.setItem(galleryKey(uid), JSON.stringify({ ts:Date.now(), items:items||[] })); }catch(_){}
+}
+function clearCachedGallery(uid){
+  try{ sessionStorage.removeItem(galleryKey(uid)); }catch(_){}
+}
+
+
+  function ageFrom(s){ if(!s) return {label:'–'}; const d=new Date(s), n=new Date(); let m=(n.getFullYear()-d.getFullYear())*12+(n.getMonth()-d.getMonth()); if(n.getDate()<d.getDate()) m--; return m<24?{label:`${m} Mon.`}:{label:`${Math.floor(m/12)} J.`}; }
+  function fmtDateDE(s){ if(!s) return '–'; const d=new Date(s); if(isNaN(d)) return '–'; const dd=String(d.getDate()).padStart(2,'0'); const mm=String(d.getMonth()+1).padStart(2,'0'); return `${dd}.${mm}.${d.getFullYear()}`; }
+  function setPrivacy(isOwner){ $$('.dm2-private').forEach(el=>el.classList.toggle('hidden', !isOwner)); }
+  // Gleicher Compressor wie im HDM
+  window.compressImage = async function(file, {
+    maxW = 1600, maxH = 1600,
+    targetBytes = 600 * 1024,   // Ziel 400–600 KB
+    qualityMin = 0.5, qualityMax = 0.9,
+    minW = 900, minH = 900,
+    mimePreferred = 'image/webp'
+  } = {}) {
+    let src;
+    try { src = await createImageBitmap(file); }
+    catch {
+      src = await new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+        img.src = url;
+      });
+    }
+    const ratio = Math.min(1, maxW/src.width, maxH/src.height);
+    const baseW = Math.max(1, Math.round(src.width*ratio));
+    const baseH = Math.max(1, Math.round(src.height*ratio));
+
+    const canvas = document.createElement('canvas');
+    function draw(w,h){
+      canvas.width=w; canvas.height=h;
+      const ctx = canvas.getContext('2d',{alpha:false});
+      ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h);
+      ctx.drawImage(src,0,0,w,h);
+    }
+    async function encode(type,q){
+      const blob = await new Promise(res=>canvas.toBlob(res, type, q));
+      if (!blob) return null; if (type && blob.type && blob.type!==type) return null; return blob;
+    }
+    const supportsWebP = (()=>{ try{ return canvas.toDataURL('image/webp').startsWith('data:image/webp'); }catch{ return false; } })();
+    const encoders=[]; if (mimePreferred==='image/webp' && supportsWebP) encoders.push('image/webp'); encoders.push('image/jpeg');
+    const nameWith = (name,type)=> name.replace(/\.(heic|heif|png|jpe?g|webp|avif)$/i,'') + (type==='image/webp'?'.webp':'.jpg');
+
+    draw(baseW, baseH);
+    for (const type of encoders){
+      let lo=qualityMin, hi=qualityMax, best=null;
+      for(let i=0;i<8;i++){
+        const q=(lo+hi)/2, b=await encode(type,q);
+        if(!b){ best=null; break; }
+        if(b.size<=targetBytes){ best=b; lo=q; } else { hi=q; }
+      }
+      if(best) return new File([best], nameWith(file.name,type), { type });
+
+      let w=baseW,h=baseH;
+      for(let s=0;s<6 && (w>minW||h>minH); s++){
+        w=Math.max(minW,Math.round(w*0.85)); h=Math.max(minH,Math.round(h*0.85));
+        draw(w,h);
+        let lo2=qualityMin, hi2=qualityMax, best2=null;
+        for(let j=0;j<6;j++){
+          const q=(lo2+hi2)/2, b=await encode(type,q);
+          if(!b){ best2=null; break; }
+          if(b.size<=targetBytes){ best2=b; lo2=q; } else { hi2=q; }
+        }
+        if(best2) return new File([best2], nameWith(file.name,type), { type });
+      }
+      const last = await encode(type, qualityMin);
+      if (last && last.size < file.size * 0.95) return new File([last], nameWith(file.name,type), { type });
+      draw(baseW, baseH);
+    }
+    return null;
+  };
+
+
+// Warten bis alle nötigen Knoten vorhanden sind
+const _need=['dm2Profile','dm2HdmGrid','dm2GalleryGrid','dm2Modal'];
+const _ok = await waitFor(()=> _need.every(id=>document.getElementById(id)));
+if(!_ok){
+  const miss=_need.filter(id=>!document.getElementById(id));
+  console.warn('[DM] fehlende IDs → Abbruch:', miss);
+  return;
+}
+
+
+const ui={
+
+    cover:$('#dm2Cover'), coverFile:$('#dm2FileCover'),
+    avatarImg:$('#dm2Avatar'), file:$('#dm2File'),
+    name:$('#dm2Name'), handle:$('#dm2Handle'), bio:$('#dm2Bio'),
+    age:$('#dm2Age'), breed:$('#dm2Breed'),
+    statsPosts:$('#dm2PostsCount'), followers:$('#dm2Followers'), following:$('#dm2Following'),
+    gear:$('#dm2Gear'), share:$('#dm2Share'), menu:$('#dm2Menu'), followBtn:$('#dm2FollowBtn'),
+    membership:$('#dm2Membership'), logout:$('#dm2Logout'), editBtn:$('#dm2EditBtn'), editAvatarBtn:$('#dm2EditAvatar'),
+    tabs:$$('.dm2-tab'),
+    hdmSection:$('#dm2HdmSection'), hdmGrid:$('#dm2HdmGrid'),
+    galleryGrid:$('#dm2GalleryGrid'), galleryAdd:$('#dm2GalleryAdd'), galleryFile:$('#dm2GalleryFile'),
+
+    ab:{name:$('#ab2Name'),sex:$('#ab2Sex'),birth:$('#ab2Birth'),age:$('#ab2Age'),breed:$('#ab2Breed'),weight:$('#ab2Weight'),goal:$('#ab2Goal'),allergies:$('#ab2Allergies')},
+    modal:$('#dm2Modal'), sheet:$('#dm2Sheet'),
+    in:{bio:$('#in2Bio'),weight:$('#in2Weight'),neutered:$('#in2Neutered'),birth:$('#in2Birth'),goal:$('#in2Goal')},
+    bioCount:$('#bioCount'),
+    tagWrap:$('#in2Tags'), tagInput:$('#in2TagInput'), suggest:$('#in2Suggest'),
+    photo:$('#dm2Photo'), photoImg:$('#dm2PhotoImg'),
+    fModal:$('#dm2FollowModal'), fTitle:$('#fTitle'),
+    listFollowers:$('#listFollowers'), listFollowing:$('#listFollowing'),
+    openFollowers:$('#openFollowers'), openFollowing:$('#openFollowing'), closeFollowModal:$('#closeFollowModal')
+  };
+  ui.tabs.forEach(t=>t.addEventListener('click',()=>{ ui.tabs.forEach(x=>x.classList.remove('active')); t.classList.add('active'); $$('.dm2-panel').forEach(p=>p.classList.remove('active')); $('#dm2Tab-'+t.dataset.tab).classList.add('active'); }));
+
+  /* --- Menüs / Logout --- */
+$('#dm2Gear')?.addEventListener('click',(e)=>{e.stopPropagation();ui.menu.classList.toggle('open');});
+$('#dm2Membership')?.addEventListener('click',()=>window.$memberstackDom?.openModal?.('update-subscription'));
+$('#dm2Logout')?.addEventListener('click',async()=>{try{await window.$memberstackDom?.logout?.();}catch(_){}location.reload();});
+$('#dm2EditAvatar')?.addEventListener('click', ()=> ui.file?.click());
+
+
+  /* --- Allergie-Auswahl --- */
+  const optionsList=["Rind","Huhn","Lamm","Pferd","Kaninchen","Ente","Truthahn","Wild","Fisch","Lachs","Forelle","Thunfisch","Ei","Milchprodukte","Laktose","Gluten","Weizen","Reis","Mais","Hafer","Gerste","Kartoffel","Süßkartoffel","Kürbis","Zucchini","Karotte","Erbsen","Linsen","Bohnen","Rote Bete","Brokkoli","Fenchel","Pastinake","Topinambur","Birne","Apfel","Banane","Heidelbeeren","Cranberries","Kokos","Leinöl","Lachsöl","Hanfsamen","Flohsamen","Chiasamen","Hirse","Quinoa","Amaranth","Ziegenmilch","Petersilie","Brennnessel","Löwenzahn","Bierhefe","Algen","Eierschale","Joghurt"];
+  let selectedTags=[];
+  function renderTags(){ ui.tagWrap.innerHTML=''; selectedTags.forEach(txt=>{const s=document.createElement('span'); s.className='dm2-tag'; s.textContent=txt; const x=document.createElement('span'); x.className='x'; x.textContent='×'; x.onclick=()=>{selectedTags=selectedTags.filter(t=>t!==txt);renderTags();}; s.appendChild(x); ui.tagWrap.appendChild(s); });}
+  ui.tagInput.addEventListener('input',()=>{const v=ui.tagInput.value.toLowerCase().trim(); const c=optionsList.filter(o=>o.toLowerCase().includes(v)&&!selectedTags.includes(o)); ui.suggest.innerHTML=''; if(!v||!c.length){ui.suggest.style.display='none';return;} c.slice(0,8).forEach(o=>{const li=document.createElement('li');li.textContent=o;li.onclick=()=>{selectedTags.push(o);renderTags();ui.tagInput.value='';ui.suggest.style.display='none';}; ui.suggest.appendChild(li);}); ui.suggest.style.display='block';});
+  // Beim Fokus den Sheet-Scroller nach unten fahren, damit Suggest + Tastatur sichtbar sind
+ui.tagInput.addEventListener('focus', ()=>{
+  const sheet = ui.sheet;
+  if(!sheet) return;
+  sheet.scrollTo({ top: sheet.scrollHeight, behavior:'smooth' });
+});
+
+document.addEventListener('click',(e)=>{ if(ui.tagInput && ui.suggest && !ui.tagInput.contains(e.target) && !ui.suggest.contains(e.target)) ui.suggest.style.display='none'; });
+
+  /* --- UI füllen --- */
+  function hydrate(cf={}, isOwner=false){
+    const name=cf.hundename||cf.name||'Dein Hund';
+    ui.name.textContent=name; ui.handle.textContent='@'+(name?name.toLowerCase().replace(/\s+/g,'_'):'doggo');
+    if(cf.profilbild) ui.avatarImg.src=cf.profilbild;
+    if(cf.profilcover) ui.cover.style.backgroundImage=`url("${cf.profilcover}")`;
+    ui.age.textContent=ageFrom(cf.geburtstag).label; ui.breed.textContent=cf.rasse||'Lieblingsfell';
+    const bio=cf.bio?String(cf.bio):''; ui.bio.textContent=bio; ui.bio.style.display=bio?'block':'none';
+    ui.ab.name.textContent=name; ui.ab.sex.textContent=cf.geschlecht||'–'; ui.ab.birth.textContent=fmtDateDE(cf.geburtstag);
+    ui.ab.age.textContent=ageFrom(cf.geburtstag).label; ui.ab.breed.textContent=cf.rasse||'–';
+    ui.ab.weight.textContent=cf.gewicht?`${cf.gewicht} kg`:'–'; ui.ab.goal.textContent=cf.endgewicht?`${cf.endgewicht} kg`:'–';
+    const arr=Array.isArray(cf.allergien)?cf.allergien:(cf.allergien?String(cf.allergien).split(',').map(s=>s.trim()).filter(Boolean):[]);
+    ui.ab.allergies.textContent=arr.length?arr.join(', '):'–';
+    ui.in.bio.value=bio; ui.in.weight.value=cf.gewicht||''; ui.in.neutered.value=cf.kastriert||''; ui.in.birth.value=cf.geburtstag||''; ui.in.goal.value=cf.endgewicht||'';
+    selectedTags=arr.slice(); renderTags(); setPrivacy(isOwner);
+  }
+
+  $('.dm2-avatar')?.addEventListener('click', ()=>{ $('#dm2PhotoImg').src=ui.avatarImg.src; $('#dm2Photo').classList.add('open'); document.body.classList.add('dm2-lock'); });
+$('#dm2Photo')?.addEventListener('click',(e)=>{ if(e.target.id==='dm2Photo') { e.currentTarget.classList.remove('open'); document.body.classList.remove('dm2-lock'); } });
+
+    /* === POSTS LADEN – HDM + PROFIL-GALERIE (mit Bugfix für Klick-Navigation) === */
+	
+	/* Likes sammeln (Count + ob Viewer geliked hat) ohne RPC */
+async function enrichLikesWithoutRpc(sb, pics, viewerId){
+  try{
+    const ids = (pics||[]).map(p=>p.id).filter(Boolean);
+    if (!sb || !ids.length) return pics;
+
+    const { data: rows } = await sb
+      .from('hund_des_monats_likes')
+      .select('bild_id, memberstack_id')
+      .in('bild_id', ids);
+
+    const countMap = new Map();
+    const likedSet = new Set();
+    (rows||[]).forEach(r=>{
+      countMap.set(r.bild_id, (countMap.get(r.bild_id)||0)+1);
+      if (viewerId && String(r.memberstack_id)===String(viewerId)) likedSet.add(r.bild_id);
+    });
+
+    return (pics||[]).map(p => Object.assign({}, p, {
+      likes: countMap.get(p.id)||0,
+      liked: likedSet.has(p.id)
+    }));
+  }catch(_){
+    return pics;
+  }
+}
+
+	
+  async function loadPostsFor(profileUid){
+    const sb = await getSB();
+    const hdmGrid = ui.hdmGrid;
+    const hdmSection = ui.hdmSection;
+	  if(!hdmGrid || !hdmSection){
+    console.warn('[Profile] HDM-Container fehlt – lade nur Galerie.');
+    await loadGalleryFor(profileUid);
+    return;
+  }
+    hdmGrid.innerHTML = '';
+
+    // Cache (nur für HDM)
+    const cached = getCachedPosts(profileUid);
+    if (cached && cached.length) renderHdmGrid(cached);
+
+    if (!sb || !profileUid){
+      if (!cached?.length){
+        hdmSection.style.display = 'none';
+      }
+      // Galerie separat laden
+      await loadGalleryFor(profileUid);
+      return;
+    }
+
+    let pics = [];
+    try{
+      const r1 = await sb.from('hund_des_monats')
+        .select('id,bild_url,hundename,memberstack_id,member_id,owner_id,uid,created_at')
+        .or(`memberstack_id.eq.${profileUid},member_id.eq.${profileUid},owner_id.eq.${profileUid},uid.eq.${profileUid}`)
+        .order('created_at',{ascending:false});
+      pics = r1.data || [];
+// Fallback: wenn nach RPC-Merge noch keine likes/liked vorhanden -> lokal anreichern
+try{
+  const ms = await getMS();
+  const me = ms ? await getMemberNormalized(ms) : { id:null };
+  const viewerId = me?.id || null;
+  const missing = !(pics||[]).some(p => ('likes' in p) || ('liked' in p));
+  if (missing) pics = await enrichLikesWithoutRpc(sb, pics, viewerId);
+}catch(_){}
+
+
+      if(!pics.length){
+        const likePattern = `%${profileUid}_%`;
+        const r2 = await sb.from('hund_des_monats')
+          .select('id,bild_url,hundename,created_at')
+          .like('bild_url', likePattern)
+          .order('created_at',{ascending:false});
+        pics = r2.data || [];
+      }
+
+      if(!pics.length && sb.rpc){
+        try{
+          const r3 = await sb.rpc('get_hund_des_monats_with_likes', { p_memberstack_id: profileUid });
+          const all = r3?.data || [];
+          pics = all.filter(p => [p.memberstack_id,p.member_id,p.owner_id,p.uid].filter(Boolean).map(String).includes(String(profileUid)));
+        }catch(_){}
+      }
+    }catch(e){ console.warn('[HDM posts ERROR]', e); }
+
+    setCachedPosts(profileUid, pics);
+    renderHdmGrid(pics);
+
+    // Profil-Galerie laden
+    const galleryCount = await loadGalleryFor(profileUid);
+
+    // Gesamtzähler: HDM + Galerie
+    try{
+      ui.statsPosts.textContent = String((pics?.length||0) + (galleryCount||0));
+    }catch{}
+
+ function renderHdmGrid(items){
+  hdmGrid.innerHTML = '';
+
+  if(!items.length){
+    hdmSection.style.display = 'none';
+    return;
+  }
+  hdmSection.style.display = '';
+
+  items.forEach(p=>{
+    const id    = p.id;
+    const url   = p.bild_url;
+    const name  = p.hundename || 'Doggo';
+    const postKey = (id!=null) ? String(id) : url;
+
+    const card = document.createElement('div');
+    card.className = 'dm2-card';
+    card.innerHTML = `
+      <img src="${url}" alt="${name}">
+      <div class="hdm-name-like-row">
+        <div class="hdm-dogname">${name}</div>
+        <button class="hdm-likes${p.liked ? ' liked' : ''}" data-id="${id ?? ''}" title="Gefällt mir" type="button">
+          <span class="heart">
+            <svg class="heart-outline" viewBox="0 0 24 24" width="23" height="23" aria-hidden="true">
+              <path d="M12 21c-.6 0-1.2-.21-1.65-.62C6.05 17.17 2 13.39 2 9.5
+               2 6.42 4.42 4 7.5 4c1.74 0 3.41.81 4.5 2.09C13.09 4.81
+               14.76 4 16.5 4 19.58 4 22 6.42 22 9.5c0 3.89-4.05 7.67-8.35
+               10.88-.45.41-1.05.62-1.65.62z" stroke="#d77f47" stroke-width="2.1" fill="none"/>
+            </svg>
+          </span>
+          <span class="hdm-like-num">${window.getLikes ? window.getLikes(p) : (p.likes||0)}</span>
+        </button>
+      </div>
+    `;
+
+    const img = card.querySelector('img');
+    wireImgFallback?.(img);
+
+// Ganze Karte klickbar; Like-Button ausnehmen
+card.style.cursor = 'pointer';
+ card.addEventListener('click', (e)=>{
+   const el = (e.target instanceof Element) ? e.target : null;
+ if (el?.closest('.hdm-likes')) return;
+  openHdmDetailInProfile(p);                  // ⟵ Detail-Overlay im Profil öffnen
+});
+
+
+
+    // Zahl erzwingen & Herz einfärben (HDM-Helfer, mit Fallbacks aus A)
+    const likeBtn = card.querySelector('.hdm-likes');
+    window.forceLikeNumber?.(likeBtn, p);
+    window.setHeartVisualBox?.(likeBtn, !!p.liked);
+
+    // Like-Toggle (optimistisch), nutzt rpcToggleLike wenn vorhanden
+    likeBtn.addEventListener('click', async (e)=>{
+      e.stopPropagation();
+      if (!id) return; // nur HDM-Einträge liken
+      if (window.isLikePending?.(id)) return;
+
+      window.setLikePending?.(id, true);
+
+      const wasLiked = likeBtn.classList.contains('liked');
+      const numEl    = likeBtn.querySelector('.hdm-like-num');
+      const prev     = Math.max(0, parseInt(numEl?.textContent||'0',10));
+
+      // Optimistisch
+      const optimisticLiked = !wasLiked;
+      const optimisticCount = optimisticLiked ? prev+1 : Math.max(0, prev-1);
+      likeBtn.classList.toggle('liked', optimisticLiked);
+      if(numEl) numEl.textContent = String(optimisticCount);
+
+      try{
+        if (window.rpcToggleLike){
+          const res = await window.rpcToggleLike(id);
+          window.applyLikeResultToCard?.(likeBtn, res);
+        }
+      }catch(err){
+        // Revert bei Fehler
+        likeBtn.classList.toggle('liked', wasLiked);
+        if(numEl) numEl.textContent = String(prev);
+      }finally{
+        window.setLikePending?.(id, false);
+      }
+    });
+
+    hdmGrid.appendChild(card);
+  });
+}
+
+  }
+
+  /* Profil-Galerie laden (Supabase Storage 'profile-gallery' per User-Prefix) */
+/* Profil-Galerie laden (Supabase Storage 'profile-gallery' per User-Prefix) */
+async function loadGalleryFor(profileUid){
+  const sb = await getSB();
+  const grid = ui.galleryGrid;
+  if (!grid) return 0;
+
+  grid.innerHTML = ''; // keine Plus-Kachel mehr
+
+  // 1) Cache sofort rendern (wenn vorhanden)
+  const cached = getCachedGallery(profileUid);
+  if (Array.isArray(cached) && cached.length){
+    cached.forEach(item=>{
+      const cell = document.createElement('div');
+      cell.className='dm2-gallery-item';
+	  cell.dataset.uid  = item.uid;
+cell.dataset.name = item.name;
+
+      const img = document.createElement('img');
+      img.src=item.url; img.alt='Foto'; wireImgFallback(img);
+      cell.appendChild(img);
+      cell.addEventListener('click', ()=> openProfilePhotoDetail(item));
+      grid.appendChild(cell);
+    });
+  }
+
+  // 2) Frisch laden (und Cache ersetzen)
+  if(!sb || !profileUid) return cached?.length || 0;
+
+  let files = [];
+  try{
+    const { data:list } = await sb.storage
+      .from('profile-gallery')
+      .list(`${profileUid}`, { limit: 200, offset:0, sortBy:{ column:'name', order:'desc' } });
+    files = Array.isArray(list) ? list : [];
+  }catch(e){ console.warn('[gallery list]', e); }
+
+  const urls = files.map(f=>{
+    const { data } = sb.storage.from('profile-gallery').getPublicUrl(`${profileUid}/${f.name}`);
+    return {
+      uid:  String(profileUid),
+      name: String(f.name),
+      url:  data?.publicUrl || '',
+      ts:   f.name.match(/(\d{13})/)? Number(RegExp.$1) : 0
+    };
+  }).filter(x=>x.url);
+
+  // Neueste zuerst (Timestamp im Dateinamen), sonst Name
+  urls.sort((a,b)=> (b.ts - a.ts) || (a.name < b.name ? 1 : -1));
+
+  // UI ersetzen (frisches Ergebnis rendert „über“ dem evtl. veralteten Cache)
+  grid.innerHTML = '';
+  urls.forEach(item=>{
+    const cell = document.createElement('div');
+    cell.className='dm2-gallery-item';
+	cell.dataset.uid  = item.uid;
+cell.dataset.name = item.name;
+
+    const img = document.createElement('img');
+    img.src=item.url; img.alt='Foto'; wireImgFallback(img);
+    cell.appendChild(img);
+    cell.addEventListener('click', ()=> openProfilePhotoDetail(item));
+    grid.appendChild(cell);
+  });
+
+  // Cache setzen
+  setCachedGallery(profileUid, urls);
+  return urls.length;
+}
+
+
+  /* --- Modal-Logik --- */
+  let scrollMem=0;
+  let pgScrollMem = 0;
+  function openSheet(){ scrollMem=window.scrollY||0; document.body.classList.add('dm2-lock'); document.body.style.top=`-${scrollMem}px`; $('#dm2Modal').classList.add('open'); }
+  function closeSheet(){ $('#dm2Modal').classList.remove('open'); document.body.classList.remove('dm2-lock'); document.body.style.top=''; window.scrollTo(0,scrollMem); }
+$('#dm2EditBtn')?.addEventListener('click', openSheet);
+$('#dm2Modal')?.addEventListener('click',(e)=>{ if(e.target===e.currentTarget) closeSheet(); });
+document.addEventListener('keydown',(e)=>{
+  if(e.key==='Escape' && $('#dm2Modal')?.classList?.contains('open')) closeSheet();
+});
+
+$('#dm2Cancel')?.addEventListener('click', closeSheet);
+
+
+  /* --- Follower-Listen (unverändert) --- */
+$('#openFollowers')?.addEventListener('click',()=>{}); // Handler wird unten gesetzt
+$('#openFollowing')?.addEventListener('click',()=>{});
+
+
+  (async ()=>{
+    // NEU: Memberstack + Supabase parallel holen -> schneller
+const [ms, sb] = await Promise.all([getMS(), getSB()]);
+console.log('[DM] MS/SB ready?', { ms: !!ms, sb: !!(sb && sb.from) });
+    let myId=null,myCF={};
+    if(ms){ const me=await getMemberNormalized(ms); myId=me.id; myCF=me.cf||{}; }
+
+    // global merken (für Session-Stash beim Post-Klick)
+    window._DM_MY_ID = myId || null;
+
+    const profileUid = myId;         // eigenes Profil
+    hydrate(myCF, true);
+    await loadPostsFor(profileUid);
+	
+    // --- Profil-Galerie Upload ---
+    function extFromType(blob){
+      return blob?.type === 'image/webp' ? '.webp' : (blob?.type === 'image/png' ? '.png' : '.jpg');
+    }
+ // FAB öffnet den Dateiauswahl-Dialog
+$('#dm2FabAdd')?.addEventListener('click', ()=> ui.galleryFile?.click());
+
+    ui.galleryFile?.addEventListener('change', async (e)=>{
+      const f = e.target.files?.[0]; if(!f) return;
+      const me = await getMemberNormalized(ms); const myId = me.id;
+      if(!myId){ alert('Bitte einloggen.'); return; }
+
+      const compressed = await window.compressImage(f, { maxW:1600, maxH:1600, targetBytes:600*1024, mimePreferred:'image/webp' });
+      const uploadFile = compressed || f;
+
+      const safe = s=>s.replace(/[^a-zA-Z0-9._-]/g,'_');
+      const base = `g_${Date.now()}_${safe(f.name)}`.replace(/\.(heic|heif|png|jpe?g|webp|avif)$/i,'');
+      const path = `${myId}/${base}${extFromType(uploadFile)}`;
+
+const up = await sb.storage.from('profile-gallery').upload(path, uploadFile, { upsert:true, cacheControl:'3600' });
+if(up?.error){ alert('Upload fehlgeschlagen: '+up.error.message); return; }
+
+const pub = sb.storage.from('profile-gallery').getPublicUrl(path);
+const newUrl = pub?.data?.publicUrl || '';
+
+// Cache refreshen & UI updaten
+clearCachedGallery(myId);
+await loadGalleryFor(myId);
+e.target.value='';
+
+// Sofort ins Detail springen (wie HDM)
+if(newUrl){
+  openProfilePhotoDetail({ uid: String(myId), name: path.split('/').pop(), url: newUrl });
+}
+}); 
+
+
+    // Public Profile + Media-Tabellen synchron halten
+    async function dm_syncPublicProfile(sb, myId, cf){ try{ if(!sb||!myId) return; const row={memberstack_id:myId,hundename:cf?.hundename||cf?.name||null,geschlecht:cf?.geschlecht||null,geburtstag:cf?.geburtstag||null,rasse:cf?.rasse||null,bio:cf?.bio||null,updated_at:new Date().toISOString()}; await sb.from('doggo_public_profile').upsert(row,{onConflict:'memberstack_id'});}catch(e){console.warn('[syncPublicProfile]',e);} }
+    async function upsertMedia(sb,myId,{avatar_url=null,cover_url=null}={}){ try{ if(!sb||!myId) return; const row={memberstack_id:myId}; if(avatar_url) row.avatar_url=avatar_url; if(cover_url) row.cover_url=cover_url; await sb.from('doggo_profile_media').upsert(row,{onConflict:'memberstack_id'});}catch(e){console.warn('[upsertMedia]',e);} }
+
+    if(sb && myId){
+      await dm_syncPublicProfile(sb, myId, Object.assign({hundename:myCF.hundename||ui.name.textContent, rasse:myCF.rasse||$('#ab2Breed').textContent}, myCF));
+      const bg = getComputedStyle($('#dm2Cover')).backgroundImage || '';
+      const coverUrl = bg.startsWith('url(') ? bg.slice(4,-1).replace(/^"|"$|^'|'$/g,'') : '';
+      await upsertMedia(sb, myId, { avatar_url: myCF.profilbild || $('#dm2Avatar').src || null, cover_url: myCF.profilcover || coverUrl || null });
+    }
+
+$('#dm2Share')?.addEventListener('click', async ()=>{
+      const shareUrl=`${location.origin}/user?uid=${encodeURIComponent(profileUid)}`;
+      if(navigator.share){
+        try{ await navigator.share({title:$('#dm2Name').textContent||'DoggoMeal', text:'Schau dir dieses Profil auf DoggoMeal an 🐾', url:shareUrl}); }catch(_){}
+      }else{
+        try{ await navigator.clipboard.writeText(`Schau dir dieses Profil auf DoggoMeal an 🐾\n${shareUrl}`); alert('Link kopiert!'); }catch(_){ alert(shareUrl); }
+      }
+    });
+
+    async function refreshFollow(){
+      const sb2=await getSB(); if(!sb2||!profileUid) return;
+      const { data:a }=await sb2.from('doggo_follows').select('follower_id,followee_id');
+      const followers=(a||[]).filter(x=>String(x.followee_id)===String(profileUid)).map(x=>x.follower_id);
+      const following=(a||[]).filter(x=>String(x.follower_id)===String(profileUid)).map(x=>x.followee_id);
+      $('#dm2Followers').textContent=followers.length; $('#dm2Following').textContent=following.length;
+
+      async function fill(ids, listEl){
+        listEl.innerHTML=''; if(!ids.length){ listEl.innerHTML='<div style="opacity:.6;padding:10px 12px">Noch leer</div>'; return; }
+        const { data:profiles } = await sb2.from('doggo_public_profile').select('*').in('memberstack_id', ids);
+        const { data:media }    = await sb2.from('doggo_profile_media').select('*').in('memberstack_id', ids);
+        const mapP=new Map((profiles||[]).map(r=>[String(r.memberstack_id),r])); const mapM=new Map((media||[]).map(r=>[String(r.memberstack_id),r]));
+        ids.forEach(uid=>{
+          const p=mapP.get(String(uid))||{}; const m=mapM.get(String(uid))||{};
+          const displayName = p.hundename || 'Doggo';
+          const row=document.createElement('div'); row.className='dm2-user-row';
+          row.innerHTML = `
+            <img src="${m.avatar_url||'https://via.placeholder.com/80?text=D'}" alt="">
+            <div class="dm2-user-text">
+              <div class="dm2-user-name">${displayName}</div>
+              <div class="dm2-user-handle">@${(displayName||'doggo').toLowerCase().replace(/\s+/g,'_')}</div>
+            </div>
+          `;
+ row.addEventListener('click', (e)=>{
+   const el = (e.target instanceof Element) ? e.target : null;
+  if (el?.closest('.dm2-mini-follow')) return;
+            if(String(uid)===String(myId)){ closeFollowModal(); return; }
+            location.href=`/user?uid=${encodeURIComponent(uid)}`;
+          });
+          listEl.appendChild(row);
+        });
+      }
+
+      $('#openFollowers').onclick = ()=>{ fill(followers, $('#listFollowers')); openFollowModal('followers'); };
+      $('#openFollowing').onclick = ()=>{ fill(following, $('#listFollowing')); openFollowModal('following'); };
+    }
+    refreshFollow();
+
+    /* Avatar upload */
+$('#dm2File')?.addEventListener('change', async ()=>{
+      const f=$('#dm2File').files?.[0]; if(!f){return;}
+      const sb=await getSB(); const ms=await getMS(); const me=await getMemberNormalized(ms); const myId=me.id; if(!sb||!myId) return;
+      const safe = s=>s.replace(/[^a-zA-Z0-9._-]/g,'_'); const processed = await compressImage(f, { maxW:1440, maxH:1440, targetBytes:300*1024, mimePreferred:'image/webp' });
+const fileToUp  = processed || f;
+const path = `${myId}/avatar_${Date.now()}_${safe(fileToUp.name || 'avatar.jpg')}`;
+const up   = await sb.storage.from('avatars').upload(path, fileToUp, { upsert:true, cacheControl:'3600' });
+
+      if(up?.error){ alert('Upload fehlgeschlagen: '+up.error.message); return; }
+      const { data:pub }=sb.storage.from('avatars').getPublicUrl(path); const url=pub?.publicUrl;
+      if(url){
+        $('#dm2Avatar').src=url;
+        try{ await ms.updateMember({ customFields:{ profilbild:url } }); }catch(_){}
+        try{ await sb.from('doggo_profile_media').upsert({ memberstack_id: myId, avatar_url: url }, { onConflict: 'memberstack_id' }); }catch(_){}
+        try{ await sb.from('doggo_public_profile').upsert({ memberstack_id: myId, hundename: $('#dm2Name').textContent }, { onConflict: 'memberstack_id' }); }catch(_){}
+        alert('Profilbild aktualisiert ✅');
+      }
+      $('#dm2File').value='';
+    });
+
+    /* Cover upload */
+$('#dm2Cover')?.addEventListener('click', ()=> $('#dm2FileCover')?.click());
+$('#dm2FileCover')?.addEventListener('change', async ()=>{
+
+      const f=$('#dm2FileCover').files?.[0]; if(!f){return;} const sb=await getSB(); const ms=await getMS(); const me=await getMemberNormalized(ms); const myId=me.id; if(!sb||!myId){return;}
+      const safe=s=>s.replace(/[^a-zA-Z0-9._-]/g,'_'); const processed = await compressImage(f, { maxW:1600, maxH:1600, targetBytes:300*1024, mimePreferred:'image/webp' });
+const fileToUp  = processed || f;
+const path = `${myId}/cover_${Date.now()}_${safe(fileToUp.name || 'cover.jpg')}`;
+const up   = await sb.storage.from('profile-banners').upload(path, fileToUp, { upsert:true, cacheControl:'3600' });
+
+      if(up?.error){ alert('Upload fehlgeschlagen: '+up.error.message); return; }
+      const { data:pub }=sb.storage.from('profile-banners').getPublicUrl(path); const url=pub?.publicUrl;
+      if(url){
+        $('#dm2Cover').style.backgroundImage=`url("${url}")`;
+        try{ await ms.updateMember({ customFields:{ profilcover:url } }); }catch(_){}
+        try{ await sb.from('doggo_profile_media').upsert({ memberstack_id: myId, cover_url: url }, { onConflict: 'memberstack_id' }); }catch(_){}
+        alert('Banner aktualisiert ✅');
+      }
+      $('#dm2FileCover').value='';
+    });
+
+    /* Edit-Sheet speichern */
+const MAX_BIO=70;
+function updateBioCounter(){
+  const el = $('#in2Bio'); if(!el) return;
+  let v = el.value || '';
+  if(v.length > MAX_BIO){ v = v.slice(0, MAX_BIO); el.value = v; }
+  $('#bioCount') && (ui.bioCount.textContent = `${v.length}/${MAX_BIO}`);
+}
+$('#in2Bio')?.addEventListener('input', updateBioCounter);
+updateBioCounter();
+
+$('#dm2Save')?.addEventListener('click', async ()=>{
+      const ms=await getMS(); const sb=await getSB(); if(!ms) return alert('Memberstack noch nicht bereit.');
+      const updates={ bio: $('#in2Bio').value.slice(0,MAX_BIO), gewicht: $('#in2Weight').value, kastriert: $('#in2Neutered').value, geburtstag: $('#in2Birth').value, endgewicht: $('#in2Goal').value, allergien: selectedTags };
+      try{
+        await ms.updateMember({ customFields: updates });
+        const bg = getComputedStyle($('#dm2Cover')).backgroundImage || '';
+        const coverUrl = bg.startsWith('url(') ? bg.slice(4,-1).replace(/^"|"$|^'|'$/g,'') : '';
+        const merged=Object.assign({}, updates, { hundename:$('#dm2Name').textContent, rasse:$('#ab2Breed').textContent, profilbild:$('#dm2Avatar').src, profilcover: coverUrl });
+        hydrate(merged, true);
+        const me=await getMemberNormalized(ms);
+        try{ await sb.from('doggo_public_profile').upsert({ memberstack_id: me.id, hundename: $('#dm2Name').textContent, bio: merged.bio, rasse: merged.rasse, geburtstag: merged.geburtstag }, { onConflict: 'memberstack_id' }); }catch(_){}
+try{ await sb.from('doggo_profile_media').upsert({ memberstack_id: me.id, avatar_url: $('#dm2Avatar').src, cover_url: coverUrl }, { onConflict: 'memberstack_id' }); }catch(_){}
+
+// NEU: Galerie-Cache leeren, damit Captions/Bilder neu kommen
+clearCachedGallery(me.id);
+
+$('#dm2Cancel').click();
+alert('Änderungen gespeichert ✅');
+
+      }catch(e){ console.error(e); alert('Speichern fehlgeschlagen.'); }
+    });
+
+    /* Bottom-Nav z-index + sichere Klick-Navigation (wie gehabt) */
+(function boostBottomNav(){
+  const nav=document.querySelector('.bottom-nav, .bottom_nav, [data-bottom-nav]');
+  if(!nav) return;
+  nav.style.zIndex='2147483000'; // Overlay (2147483647) bleibt darüber
+  nav.style.pointerEvents='auto';
+  nav.querySelectorAll('a[href]').forEach(a=>{
+    a.addEventListener('click',(e)=>{
+      e.preventDefault(); e.stopPropagation();
+      const href=a.getAttribute('href');
+      if(href) window.location.href = href;
+    });
+  });
+})();
+
+
+/* === GLOBAL: Bottom-Nav-Clicks erzwingen, auch wenn Overlays offen sind === */
+(function forceBottomNavClicks(){
+  function cleanup(){
+    try{
+      // Alle Overlays zu, Lock zurücksetzen
+      window.DGM_HDM?.closeAll?.();
+      try{ closeProfilePhotoDetail(); }catch(_){}
+      if (typeof dmCleanupLocks === 'function') dmCleanupLocks();
+      document.body.classList.remove('dm2-lock');
+      document.body.style.top = '';
+    }catch(_){}
+  }
+
+  document.addEventListener('click', (e)=>{
+   const a = (e.target instanceof Element)
+  ? e.target.closest('.bottom-nav a[href], .bottom_nav a[href], [data-bottom-nav] a[href]')
+  : null;
+    if(!a) return;
+    e.preventDefault(); e.stopPropagation();
+    const href = a.getAttribute('href');
+    cleanup();
+    if(href) window.location.href = href;
+  }, true); // capture
+})();
+
+
+  /* Follow-Modal helpers */
+  function openFollowModal(which){ $('#fTitle').textContent = which==='following' ? 'Folgt' : 'Follower'; $('#listFollowers').style.display = which==='followers' ? 'block' : 'none'; $('#listFollowing').style.display = which==='following' ? 'block' : 'none'; $('#dm2FollowModal').classList.add('open'); document.body.classList.add('dm2-lock'); }
+  function closeFollowModal(){ $('#dm2FollowModal').classList.remove('open'); document.body.classList.remove('dm2-lock'); }
+ $('#closeFollowModal')?.addEventListener('click', closeFollowModal);
+$('#dm2FollowModal')?.addEventListener('click',(e)=>{ if(e.target===e.currentTarget) closeFollowModal(); });
+
+function _navLower(z='1'){
+  const nav=document.querySelector('.bottom-nav, .bottom_nav, [data-bottom-nav]');
+  if(!nav) return;
+  if(!nav.dataset.prevZ) nav.dataset.prevZ = nav.style.zIndex || '';
+  nav.style.zIndex = z;
+}
+function _navRestore(){
+  const nav=document.querySelector('.bottom-nav, .bottom_nav, [data-bottom-nav]');
+  if(!nav) return;
+  const prev = nav.dataset.prevZ ?? '';
+  nav.style.zIndex = prev;
+  delete nav.dataset.prevZ;
+}
+
+/* NEU: HDM-Karte im Profil direkt im Profil-Overlay öffnen */
+function openHdmDetailInProfile(p){
+  const item = {
+    type: 'hdm',
+    id: p.id,
+    uid: p.memberstack_id || p.member_id || p.owner_id || p.uid || null,
+    name: String(p.id),
+    url: p.bild_url,
+    likes: Number(p.likes||0),
+    liked: !!p.liked,
+    hundename: p.hundename || 'Doggo'
+  };
+
+  // (optional) Namen im Overlay-Header setzen
+  const un = document.getElementById('pg-profile-username');
+  if (un) un.textContent = item.hundename;
+
+  // vorhandenes Profil-Overlay öffnen (du hast openProfilePhotoDetail schon)
+  openProfilePhotoDetail(item);
+}
+
+
+// === Profil-Galerie Detail (HDM-Optik) ===
+async function openProfilePhotoDetail(item){
+  const ov = document.getElementById('pg-detail'); if(!ov) return;
+  const img = document.getElementById('pg-detail-img');
+  const sk  = document.getElementById('pg-detail-skeleton');
+  const menu= document.getElementById('pg-detail-menu');
+
+  // Header füllen (Name/Avatar aus Profil)
+  const displayName = document.getElementById('dm2Name')?.textContent || 'Doggo';
+  const avatarUrl   = document.getElementById('dm2Avatar')?.src || 'https://i.imgur.com/ZcLLrkY.png';
+  document.getElementById('pg-profile-username').textContent = displayName;
+  const pimg = document.getElementById('pg-profile-img'); pimg.src = avatarUrl; wireImgFallback(pimg);
+
+  // Bild laden
+  sk.style.display = 'flex';
+  img.src = item.url || '';
+  wireImgFallback(img);
+  img.onload = ()=> sk.style.display = 'none';
+  img.onerror= ()=> sk.style.display = 'none';
+  
+  
+
+// Overlay öffnen (+ Scroll-Pos merken & Body fixieren)
+pgScrollMem = window.scrollY || 0;
+ov.style.display='flex';
+ov.classList.add('open');
+document.body.classList.add('dm2-lock');
+document.body.style.top = `-${pgScrollMem}px`;
+_navLower('1'); // Nav hinter das Overlay parken
+
+
+// Edge-Swipe nur einmal anhängen
+if(!ov.dataset.swipe){
+  attachEdgeSwipePG(ov, closeProfilePhotoDetail, '.hdm-detail-scroll');
+  ov.dataset.swipe = '1';
+}
+
+
+  // Menü (eigene Fotos: Bearbeiten/Löschen; fremde: Melden)
+  menu.innerHTML = '';
+  const myId = window._DM_MY_ID || null;
+  const isOwner = String(item.uid||'') === String(myId||'');
+
+  const menuBtn  = document.getElementById('pg-detail-menu-btn');
+ menuBtn.onclick = (e)=>{ e.stopPropagation(); menu.style.display = (menu.style.display==='block')?'none':'block'; };
+  if (window._pgMenuOutsideHandler) document.removeEventListener('click', window._pgMenuOutsideHandler);
+  window._pgMenuOutsideHandler = (e)=>{ if(!menu.contains(e.target) && e.target!==menuBtn) menu.style.display='none'; };
+  document.addEventListener('click', window._pgMenuOutsideHandler);
+
+if (isOwner){
+  const editBtn = document.createElement('button');
+  editBtn.textContent = 'Beschreibung bearbeiten';
+  editBtn.onclick = ()=>{
+    menu.style.display='none';
+    pg_editCaption(item);
+  };
+
+  const delBtn = document.createElement('button');
+  delBtn.textContent = 'Foto löschen';
+  delBtn.onclick = async ()=>{
+    menu.style.display='none';
+    if(delBtn.disabled) return;
+    if(!confirm('Foto wirklich löschen?')) return;
+    delBtn.disabled = true;
+    try{
+      const sb = await getSB();
+      await sb.storage.from('profile-gallery').remove([ `${item.uid}/${item.name}` ]);
+      // Cache leeren, damit das Grid sofort stimmt
+      try{ clearCachedGallery(item.uid); }catch(_){}
+      closeProfilePhotoDetail();
+      await loadGalleryFor(item.uid);
+    }catch(e){
+      alert('Löschen fehlgeschlagen.');
+    }finally{
+      delBtn.disabled = false;
+    }
+  };
+
+  menu.append(editBtn, delBtn);
+}else{
+  const reportBtn = document.createElement('button');
+  reportBtn.textContent = 'Beitrag melden';
+  reportBtn.onclick = ()=>{ 
+    menu.style.display='none';
+    guardedReport('profile_gallery', `${item.uid}/${item.name}`, reportBtn);
+  };
+  menu.append(reportBtn);
+}
+
+
+
+  // Caption laden/anzeigen
+  await pg_renderCaption(item);
+
+// Profilklick -> /user?uid=... (nur wenn NICHT eigener Beitrag)
+document.getElementById('pg-profile-link').onclick = ()=>{
+  const myId = window._DM_MY_ID || null;
+  closeProfilePhotoDetail();
+  if (String(item.uid||'') === String(myId||'')) return; // eigener Beitrag: im eigenen Profil bleiben
+  setTimeout(()=>{ location.href = `/user?uid=${encodeURIComponent(item.uid)}`; }, 10);
+};
+
+// Like-Button setzen (nutzt das globale Modul)
+const likeBox = document.getElementById('pg-detail-likebox');
+if (likeBox){
+  likeBox.innerHTML = '';
+  if (item.type === 'hdm'){
+    // HDM-Post (id muss existieren)
+    window.DGMlikes?.renderButton(likeBox, {
+      type: 'hdm',
+      id: item.id,
+      initial: { likes: item.likes||0, liked: !!item.liked }
+    });
+  }else{
+    // Profil-Galerie (generischer Typ, key = uid/filename)
+    const ref = `${item.uid}/${item.name}`;
+    window.DGMlikes?.renderButton(likeBox, { type: 'profile_gallery', id: ref });
+  }
+}
+
+
+
+  // Close
+  document.getElementById('pg-detail-close').onclick = ()=> closeProfilePhotoDetail();
+
+// Kommentare mounten (HDM ↔︎ Profil-Galerie korrekt unterscheiden)
+const commentsBox = document.getElementById('pg-detail-comments');
+commentsBox.innerHTML = '';
+
+const mount = document.createElement('div');
+mount.className = "dgm-comments-box";
+
+const cType = (item.type === 'hdm') ? 'hdm' : 'profile_gallery';
+const cRef  = (item.type === 'hdm') ? String(item.id) : `${item.uid}/${item.name}`;
+
+mount.dataset.commentsType  = cType;
+mount.dataset.commentsRefId = cRef;
+
+commentsBox.appendChild(mount);
+window.DGMcomments?.init(mount, { type: cType, refId: cRef });
+
+}
+function closeProfilePhotoDetail(){
+  const ov = document.getElementById('pg-detail'); if(!ov) return;
+ov.classList.remove('open');
+ov.style.display = 'none';
+document.body.classList.remove('dm2-lock');
+document.body.style.top = '';
+window.scrollTo(0, pgScrollMem||0);
+const img = document.getElementById('pg-detail-img'); if (img) img.src = '';
+const sk  = document.getElementById('pg-detail-skeleton'); if (sk) sk.style.display = 'none';
+
+_navRestore(); // ursprünglichen Z-Index der Nav zurückholen
+
+
+}
+
+// Caption helpers (optional: speichert in Tabelle 'profile_gallery_meta', falls vorhanden)
+async function pg_loadCaption(item){
+  try{
+    const sb = await getSB();
+    const { data } = await sb.from('profile_gallery_meta')
+      .select('caption').eq('memberstack_id', item.uid).eq('file_name', item.name).maybeSingle();
+    return data?.caption || '';
+  }catch{ return ''; }
+}
+async function pg_saveCaption(item, text){
+  try{
+    const sb = await getSB();
+    await sb.from('profile_gallery_meta')
+      .upsert({ memberstack_id:item.uid, file_name:item.name, caption:text }, { onConflict:'memberstack_id,file_name' });
+  }catch(_){}
+}
+async function pg_renderCaption(item){
+  const row = document.getElementById('pg-detail-caption-row');
+  row.innerHTML='';
+  const hundename = document.getElementById('pg-profile-username')?.textContent || 'Doggo';
+  const wrap = document.createElement('span'); wrap.className='hdm-caption-wrap';
+  const text = document.createElement('span'); text.className='hdm-caption-text';
+  text.textContent = await pg_loadCaption(item);
+  const username = document.createElement('span'); username.className='hdm-caption-username'; username.textContent = hundename;
+  row.append(username, wrap); wrap.appendChild(text);
+
+  if(text.textContent.trim()){
+    text.classList.add('caption-truncate');
+    requestAnimationFrame(()=>{
+      const clamped = text.scrollHeight > text.clientHeight + 1;
+      if(!clamped) text.classList.remove('caption-truncate');
+      else{
+        const t=document.createElement('button'); t.className='caption-more-btn'; t.textContent='mehr';
+        let expanded=false; t.onclick=()=>{ expanded=!expanded; text.classList.toggle('caption-truncate', !expanded); t.textContent=expanded?'weniger':'mehr'; };
+        wrap.appendChild(t);
+      }
+    });
+  }
+}
+function pg_editCaption(item){
+  const row = document.getElementById('pg-detail-caption-row');
+  const old = row.textContent?.trim() ? row.querySelector('.hdm-caption-text')?.textContent || '' : '';
+  row.innerHTML = `
+    <textarea id="pg-caption-input" rows="2" placeholder="Beschreibe das Bild...">${old||''}</textarea>
+    <button class="caption-save-btn" id="pg-caption-save">Speichern</button>`;
+  document.getElementById('pg-caption-save').onclick = async ()=>{
+    const val = (document.getElementById('pg-caption-input').value||'').trim();
+    await pg_saveCaption(item, val);
+    await pg_renderCaption(item);
+  };
+}
+
+
+/* Edge-Swipe (wie HDM, leicht vereinfacht) */
+function attachEdgeSwipePG(overlayEl, onDismiss, scrollSelector){
+  if (!overlayEl) return;
+  const panel = overlayEl.querySelector(scrollSelector) || overlayEl;
+  panel.style.willChange = 'transform';
+
+  let tracking=false, startX=0, startY=0, moved=false;
+
+  overlayEl.addEventListener('pointerdown', (e)=>{
+    if (e.clientX > 24) return;                 // nur Rand links
+    tracking=true; moved=false; startX=e.clientX; startY=e.clientY;
+    panel.style.transition='none';
+    overlayEl.setPointerCapture?.(e.pointerId);
+  });
+
+  overlayEl.addEventListener('pointermove', (e)=>{
+    if(!tracking) return;
+    const dx = e.clientX - startX, dy = Math.abs(e.clientY - startY);
+    if (dy > 12 && Math.abs(dx) < 8) return;    // vert. Scroll tolerieren
+    if (dx < 0){ panel.style.transform=`translateX(${dx*0.2}px)`; moved=true; return; }
+    e.preventDefault(); moved=true;
+    panel.style.transform = `translateX(${dx}px)`;
+  }, {passive:false});
+
+  function end(e){
+    if(!tracking) return; tracking=false;
+    overlayEl.releasePointerCapture?.(e.pointerId);
+    panel.style.transition='transform .22s ease';
+    const dx = e.clientX - startX;
+    if (moved && dx > 70){
+      panel.style.transform='translateX(100%)';
+      setTimeout(()=>{ panel.style.transform=''; onDismiss(); }, 180);
+    } else {
+      panel.style.transform='';
+    }
+  }
+  overlayEl.addEventListener('pointerup', end);
+  overlayEl.addEventListener('pointercancel', end);
+}
+
+// --- PUBLIC API: für andere Listener/Inline-Handler verfügbar machen
+window.openProfilePhotoDetail  = openProfilePhotoDetail;
+window.closeProfilePhotoDetail = closeProfilePhotoDetail;
+window.openHdmDetailInProfile  = openHdmDetailInProfile;
+
+
+  // NEU: bfcache/pageshow-Reset -> verhindert „zweiten Klick nötig“ nach Zurück vom HDM-Detail
+  function dmCleanupLocks(){
+
+    document.body.classList.remove('dm2-lock');
+    document.body.style.top='';
+    $('#dm2Modal')?.classList.remove('open');
+    $('#dm2Photo')?.classList.remove('open');
+    $('#dm2FollowModal')?.classList.remove('open');
+    $('#pg-detail')?.classList.remove('open');
+  }
+  window.addEventListener('pagehide', dmCleanupLocks);
+window.addEventListener('beforeunload', dmCleanupLocks);
+window.addEventListener('popstate', dmCleanupLocks);
+window.addEventListener('hashchange', dmCleanupLocks);
+document.addEventListener('click', (e)=>{
+const a = (e.target instanceof Element) ? e.target.closest('a[href]') : null;
+  if(!a) return;
+  const href = a.getAttribute('href') || '';
+  if (a.hasAttribute('download')) return;
+  if (/^https?:\/\//i.test(href) && !href.startsWith(location.origin)) return;
+  try { dmCleanupLocks(); }catch(_){}
+}, true);
+
+window.addEventListener('pageshow', ()=>{ dmCleanupLocks(); });
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) dmCleanupLocks(); });
+
+
+
+// ——— A) Globale HDM-Helpers für Likes ———
+window._likePending = window._likePending || new Set();
+window.setLikePending = window.setLikePending || ((id,on)=>{
+  if(on) window._likePending.add(String(id));
+  else   window._likePending.delete(String(id));
+});
+window.isLikePending  = window.isLikePending  || (id => window._likePending.has(String(id)));
+
+window.getLikes = window.getLikes || (p => Math.max(0, Number(p?.likes || 0)));
+window.forceLikeNumber = window.forceLikeNumber || ((btn,p)=>{
+  const n = btn?.querySelector?.('.hdm-like-num');
+  if(n) n.textContent = String(window.getLikes(p));
+});
+window.setHeartVisualBox = window.setHeartVisualBox || ((btn,on)=>{
+  btn?.classList?.toggle('liked', !!on);
+});
+window.applyLikeResultToCard = window.applyLikeResultToCard || ((btn,res)=>{
+  if(!btn||!res) return;
+  const n = btn.querySelector('.hdm-like-num');
+  const liked = !!res.liked_now;
+  const cnt = Math.max(0, Number(res.likes||0));
+  btn.classList.toggle('liked', liked);
+  if(n) n.textContent = String(cnt);
+});
+
+/* Fallback: Likes in hund_des_monats_likes toggeln, wenn kein rpcToggleLike vorhanden ist */
+if (!window.rpcToggleLike) {
+  window.rpcToggleLike = async function(postId){
+    try{
+      const sb = await getSB();
+      const ms = await getMS();
+      const me = ms ? await getMemberNormalized(ms) : { id:null };
+      const uid = me?.id;
+      if (!sb || !uid || !postId) return { liked_now:false, likes:0 };
+
+      // Gibt es bereits einen Like?
+      const { data: ex } = await sb
+        .from('hund_des_monats_likes')
+        .select('id')
+        .eq('bild_id', postId)
+        .eq('memberstack_id', uid)
+        .maybeSingle();
+
+      if (ex) {
+        await sb.from('hund_des_monats_likes').delete().eq('id', ex.id);
+      } else {
+        await sb.from('hund_des_monats_likes').insert({ bild_id: postId, memberstack_id: uid });
+      }
+
+      // Frischen Count holen
+      const { count } = await sb
+        .from('hund_des_monats_likes')
+        .select('*', { count:'exact', head:true })
+        .eq('bild_id', postId);
+
+      return { liked_now: !ex, likes: count || 0 };
+    }catch(_){
+      return { liked_now:false, likes:0 };
+    }
+  };
+}
+
+})();
+
+} catch(e) {
+  console.error('[DM FATAL]', e);
+}
+
+})();
+</script>
+
